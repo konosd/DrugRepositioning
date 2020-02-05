@@ -1,0 +1,445 @@
+---
+title: "Classification"
+author: "Kostas Ntagiantas"
+date: "July 18, 2018"
+output: html_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(eval = TRUE, echo = FALSE, results = "hide", warning = 
+                        FALSE, message = FALSE, cache.lazy = FALSE, fig.align = 
+                        "center" , cache = FALSE)
+library(knitr)
+library(tidyverse)
+
+code.name <- "Classification" 
+data.dir <- file.path(getwd(), "data", code.name)
+results.dir <- file.path(getwd(), "results", code.name)
+experiment <- c("GSE7127", "GSE36133", "GSE22301", "GSE35388")
+
+#Adding all useful things
+#load(file.path(data.dir, "ClassificationInput.RData"))
+load(file.path(data.dir, "finalData_Classification.RData"))
+
+```
+
+## Classification of healthy/cancerous cells using SVM
+
+With the previous analysis the most abundant differentially expressed genes have been found and can now be used as features to classify normal from melanoma cell lines. The number of features depends on the threshold selection of the previous section.
+
+```{r Features presented, results = 'markup'}
+library(kableExtra)
+
+data.frame( `Lax threshold` =paste( (genes.mel.healthy %>% filter(Set != "From all") %>% 
+  group_by(Set, Gene) %>% summarise(n = n()) %>% 
+    filter(n > threshold[1]) %>% 
+    ungroup() %>% 
+    group_by(Gene) %>% summarise(PresentIn = n() ) %>% 
+    filter(PresentIn == 6) %>% .$Gene),collapse = ", "),
+  
+  `Medium threshold` = paste((genes.mel.healthy %>% filter(Set != "From all") %>% 
+  group_by(Set, Gene) %>% summarise(n = n()) %>% 
+    filter(n > threshold[2]) %>% 
+    ungroup() %>% 
+    group_by(Gene) %>% summarise(PresentIn = n() ) %>% 
+    filter(PresentIn == 6) %>% .$Gene),collapse = ", "),
+ 
+   `Strict threshold` = paste( (genes.mel.healthy %>% filter(Set != "From all") %>% 
+  group_by(Set, Gene) %>% summarise(n = n()) %>% 
+    filter(n > threshold[3]) %>% 
+    ungroup() %>% 
+    group_by(Gene) %>% summarise(PresentIn = n() ) %>% 
+    filter(PresentIn == 6) %>% .$Gene),collapse = ", ")) %>% 
+  kable(., align = "c", caption = "Genes used as features for classification") %>% kable_styling()
+
+```
+
+
+```{r SVM Melanoma VS Healthy, eval = FALSE, include = FALSE}
+library(e1071)
+library(caret)
+library(mccr)
+#threshold values for genes selection
+threshold <- c(260, 540, 800)
+
+#Cross validation and mcc function
+cvsvm<- function(samples.index, df, nfolds){
+  dfused = df[samples.index,]
+  folds = createFolds(dfused$Status, k = nfolds)
+  accuracy = 0
+  trueControl = 0
+  mcc = 0
+  for(i in 1:length(folds)){
+    test = dfused[folds[[i]],]
+    train = dfused[-folds[[i]],]
+    model_svm = svm(Status ~ . , train, type = "C")
+    predict_svm = predict(model_svm, test[,-1])
+    conf.matrix = table(predict_svm, test$Status)
+    accuracy = accuracy + 100*(sum(diag(conf.matrix))/sum(conf.matrix))
+    trueControl = trueControl + conf.matrix[1,1]
+    mcc = mccr(as.integer(test$Status == "Control"), as.integer(predict_svm == "Control")) + mcc
+  }
+  value = c(accuracy, trueControl, mcc )/nfolds
+  
+  return(value)
+} 
+
+# df_main is the data frame that will be used in all downstream analysis
+tmp <- pheno.global %>% 
+  mutate(Status = gsub("Immortalized", "Control", Status)) %>% 
+  column_to_rownames(var = "geo_accession") %>% 
+  dplyr::select(Status)
+
+df_main <- global.exp.corrected %>% column_to_rownames(var = "SYMBOL") %>% 
+  t(.) %>% as.data.frame(.) %>% 
+  cbind(tmp, .) 
+
+control.index <- which(df_main$Status == "Control")
+case.index <- which(df_main$Status == "Melanoma")
+
+feature.genes <- genes.mel.healthy %>% filter(Set != "From all") %>% 
+  group_by(Set, Gene) %>% summarise(n = n()) %>% 
+    filter(n > threshold[1]) %>% 
+    ungroup() %>% 
+    group_by(Gene) %>% summarise(PresentIn = n() ) %>% 
+    filter(PresentIn == 6) %>% .$Gene
+
+#Testing accuracy with any number of melanoma samples
+accuracy.list <- list()
+for(i in 6:length(case.index)){
+  set.seed(1)
+  accuracy.list[[i-5]] <- replicate(10,{
+  samples.index <- c( control.index, sample(case.index, i))
+  cvsvm(samples.index = samples.index, df_main[,c("Status",feature.genes)], nfolds = 6)
+  })
+}
+svm.results <- lapply(accuracy.list, rowMeans) %>% 
+  purrr::reduce(.x = ., .f = rbind) %>% as.data.frame(.) %>% 
+  dplyr::rename(Accuracy = V1, TrueControls = V2, MCC = V3) %>% 
+  mutate(Features = "35-lax", MelSamples = c(6:length(case.index)))
+
+#Applying a medium threshold to select the feature genes
+feature.genes <- genes.mel.healthy %>% filter(Set != "From all") %>% 
+  group_by(Set, Gene) %>% summarise(n = n()) %>% 
+    filter(n > threshold[2]) %>% 
+    ungroup() %>% 
+    group_by(Gene) %>% summarise(PresentIn = n() ) %>% 
+    filter(PresentIn == 6) %>% .$Gene
+
+accuracy.list <- list()
+for(i in 6:length(case.index)){
+  set.seed(1)
+  accuracy.list[[i-5]] <- replicate(10,{
+  samples.index <- c( control.index, sample(case.index, i))
+  cvsvm(samples.index = samples.index, df_main[,c("Status",feature.genes)], nfolds = 6)
+  })
+}
+tmp <- lapply(accuracy.list, rowMeans) %>% 
+  purrr::reduce(.x = ., .f = rbind) %>% as.data.frame(.) %>% 
+  dplyr::rename(Accuracy = V1, TrueControls = V2, MCC = V3) %>% 
+  mutate(Features = "14-medium", MelSamples = c(6:length(case.index)))
+
+svm.results <- bind_rows(svm.results,tmp)
+
+#Applying a strict threshold to select the feature genes
+feature.genes <- genes.mel.healthy %>% filter(Set != "From all") %>% 
+  group_by(Set, Gene) %>% summarise(n = n()) %>% 
+    filter(n > threshold[3]) %>% 
+    ungroup() %>% 
+    group_by(Gene) %>% summarise(PresentIn = n() ) %>% 
+    filter(PresentIn == 6) %>% .$Gene
+
+accuracy.list <- list()
+for(i in 6:length(case.index)){
+  set.seed(1)
+  accuracy.list[[i-5]] <- replicate(10,{
+  samples.index <- c( control.index, sample(case.index, i))
+  cvsvm(samples.index = samples.index, df_main[,c("Status",feature.genes)], nfolds = 6)
+  })
+}
+tmp <- lapply(accuracy.list, rowMeans) %>% 
+  purrr::reduce(.x = ., .f = rbind) %>% as.data.frame(.) %>% 
+  dplyr::rename(Accuracy = V1, TrueControls = V2, MCC = V3) %>% 
+  mutate(Features = "2-strict", MelSamples = c(6:length(case.index)))
+
+svm.results <- bind_rows(svm.results,tmp)
+
+
+write.csv(svm.results, file.path(data.dir,"svm_mel_healthy.csv"),quote = FALSE)
+```
+
+```{r SVM Melanoma VS Healthy plots}
+#threshold values for genes selection
+threshold <- c(260, 540, 800)
+
+#Load the analysis of the chunk above for quick report generation
+svm.results <- read.csv(file.path(data.dir,"svm_mel_healthy.csv")) %>% 
+  dplyr::select(-1)
+
+ggplot(data = svm.results, aes(MelSamples, Accuracy, color = Features, shape = Features))+
+  geom_point(alpha = 0.8)+
+  geom_smooth()+
+  labs(title = "Mean Accuracy",
+       subtitle = "Mean of 6-fold cross validation repeated 10 times",
+       x = "Number of melanoma samples to train the model",
+       y = "Accuracy (100%)")
+
+ggplot(data = svm.results, aes(MelSamples, MCC, color = Features, shape = Features))+
+  geom_point(alpha = 0.8)+
+  geom_smooth()+
+  labs(title = "Mean MCCs",
+       subtitle = "Mean of 6-fold cross validation repeated 10 times",
+       x = "Number of melanoma samples to train the model",
+       y = "Mathews Correlation Coefficient")
+
+ggplot(data = svm.results, aes(MelSamples, TrueControls, color = Features, shape = Features))+
+  geom_point(alpha = 0.8)+
+  geom_smooth()+
+  labs(title = "Mean True Positives",
+       subtitle = "Mean of 6-fold cross validation repeated 10 times",
+       x = "Number of melanoma samples to train the model",
+       y = "Mean True Positives")
+
+```
+
+#Multi-Classification of the melanoma mutations
+
+**IGNORE THE FOLLOWING. PROBLEM WITH MARKDOWN, NOT EVERYTHING PRESENTED**
+**IGNORE THE FOLLOWING. PROBLEM WITH MARKDOWN, NOT EVERYTHING PRESENTED**
+**IGNORE THE FOLLOWING. PROBLEM WITH MARKDOWN, NOT EVERYTHING PRESENTED**
+
+~~After finding the genes that can be used as selectors between healthy and cancerous melanoma cells, it is imperative to also try and find a model to classify the different melanoma mutations. Each mutation has a different cancer mechanism, therefore, for a target therapy to work, the different targets of each mutations have to be identified.~~
+
+```{r Functions for LDA}
+
+#Remove collinear
+remove.collinear <- function(df, pearson){
+  correlation.matrix = cor(df[,-1])
+  correlation.matrix[!lower.tri(correlation.matrix)] <- 0
+  index <- c(FALSE, apply(correlation.matrix, 2, function(x) any(abs(x)>pearson)))
+  return( df[ ,!(index)] )
+}
+
+remove.collinear.index <- function(df, pearson){
+  correlation.matrix = cor(df[,-1])
+  correlation.matrix[!lower.tri(correlation.matrix)] <- 0
+  index <- c(FALSE, apply(correlation.matrix, 2, function(x) any(abs(x)>pearson)))
+  return(index)
+}
+
+#crossV function for K-fold cross-validation
+cvlda <- function(df, nfolds){
+  folds = createFolds(df$Mutation, k = nfolds)
+  accuracy = 0
+  class.vector = 0
+  for(i in 1:length(folds)){
+    train = df[-folds[[i]], ] 
+    test = df[folds[[i]], ]
+    
+    index.train = remove.collinear.index(train, 0.9)
+    index.test = remove.collinear.index(test, 0.9)
+    index = index.test | index.train
+    
+    train = train[,!index]
+    test = test[,!index]
+    
+    
+    model_lda <- lda(Mutation ~ ., train)
+    predict_lda <- predict(model_lda, test[,-1])
+    conf.matrix = confusionMatrix(predict_lda$class, factor(test$Mutation))
+    accuracy = accuracy + conf.matrix$overal['Accuracy']
+    class.vector = class.vector + diag(conf.matrix$table)/table(test$Mutation)
+  }
+  return(c(accuracy, class.vector)/nfolds)
+}
+
+
+```
+
+
+```{r LDA mutations feature genes}
+library(caret)
+library(MASS)
+
+# df_main is the data frame that will be used in all downstream analysis
+tmp <- pheno.global %>% 
+  column_to_rownames(var = "geo_accession") %>% 
+  dplyr::select(Mutation)
+
+df_main <- global.exp.corrected %>% column_to_rownames(var = "SYMBOL") %>% 
+  t(.) %>% as.data.frame(.) %>% 
+  cbind(tmp, .)# %>% filter(Mutation != "control")
+index <- which(df_main$Mutation == "control")
+df_main <- df_main[-index,]
+
+#Plotting to show importance of removing collinear
+# get_upper_tri <- function(cormat){
+#     cormat[lower.tri(cormat)]<- NA
+#     return(cormat)
+#   }
+# df <- get_upper_tri(cor(df_main[,c(feature.genes[[3]])])) %>% 
+#   as.data.frame(.) %>% rownames_to_column(var = "Var1") %>% 
+#   gather("Var2", "value", -1, na.rm = TRUE)
+# 
+# ggplot(data = df, aes(Var1, Var2, fill = value))+
+#   geom_tile(color = "white")+
+#  scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+#    midpoint = 0, limit = c(-1,1), space = "Lab", 
+#    name="Pearson\nCorrelation") +
+#   theme_minimal()+ 
+#  theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+#     size = 12, hjust = 1))+
+#  coord_fixed()
+
+
+#Feature (gene) selection has to be done.
+#A list containing all the different sources for the feature genes has to be created in order
+# for the procedure to be better understood.
+feature.genes <- list()
+#For starters trying with the DEGs when direct contrasting between the mutations w/o wt.
+feature.genes$ContrastMutMut <- genes.mut.mut %>% 
+  filter(adj.P.Val <0.05 & abs(logFC) > 1 & !grepl("wt", Set)) %>% 
+  group_by(Gene) %>% summarize(PresentIn = n()) %>% .$Gene
+
+# Including wt
+feature.genes$ContrastMutMutWt <- genes.mut.mut %>% 
+  filter(adj.P.Val <0.05 & abs(logFC) > 1 ) %>% 
+  group_by(Gene) %>% summarize(PresentIn = n()) %>% .$Gene
+
+# Now trying with  the difference of the DEGs in each mutations
+# contrast 
+feature.genes$MutHealthy <- genes.mut.healthy %>% 
+  group_by(Set, Gene) %>% summarize(n = n() ) %>% 
+  filter(n>threshold[3]) %>% ungroup %>% 
+  group_by(Gene) %>% summarise(PresentIn = n()) %>% 
+  filter(PresentIn == 1) %>% .$Gene
+
+```
+
+
+```{r LDA mutations, eval = FALSE, include=FALSE}
+# The feature genes have been selected
+# Trying with all three cases
+lda.results <- list()
+
+set.seed(1)
+lda.results[[1]] <- replicate(10, {
+  samples.index <- c( which(df_main$Mutation != "BRAF"), 
+                    sample( which(df_main$Mutation == "BRAF"), 22))     #0.6523
+  cvlda( df_main[samples.index,c("Mutation", feature.genes[[1]])], 10)
+  })
+
+set.seed(1)
+lda.results[[2]] <- replicate(10, {
+  samples.index <- c( which(df_main$Mutation != "BRAF"), 
+                    sample( which(df_main$Mutation == "BRAF"), 22))     #0.43
+  cvlda( df_main[samples.index,c("Mutation", feature.genes[[2]])], 10)
+  })
+
+set.seed(1)
+lda.results[[3]] <- replicate(10, {
+  samples.index <- c( which(df_main$Mutation != "BRAF"), 
+                    sample( which(df_main$Mutation == "BRAF"), 22))     #0.40
+  cvlda( df_main[samples.index,c("Mutation", feature.genes[[3]])], 10)
+  })
+
+names(lda.results) <- names(feature.genes)
+
+lda.results <- lapply( lda.res, function(x) as.data.frame(t(x))) %>% 
+  map2_df(.x = ., 
+          .y = gsub("Contrast", "", names(feature.genes))
+          , ~mutate(.x, Set = .y))
+
+write.csv(lda.results, file.path(data.dir, "lda_results_mutations.csv"), quote = FALSE, row.names = FALSE)
+```
+  
+  
+```{r LDA mutations plots}
+lda.results <- read.csv(file.path(data.dir, "lda_results_mutations.csv"), stringsAsFactors = FALSE)
+
+#Visualizing the results of the above analysis
+df <- lda.results %>% 
+  gather(key = MeasuredVariable, value = Measurement, -6)
+tmp <- df %>% 
+              group_by(Set, MeasuredVariable) %>% 
+              summarise(Mean = mean(Measurement) )
+
+ggplot(data = df, aes(MeasuredVariable, Measurement))+
+  geom_dotplot( aes(fill = Set, color = Set),
+                binaxis = "y", stackdir = "center", alpha = 0.7)+
+  stat_summary(fun.y = mean, fun.ymin = mean, fun.ymax = mean,
+                 geom = "crossbar",aes(group = Set), 
+               alpha = 0.5, width = 0.2, show.legend = FALSE)+
+  viridis::scale_fill_viridis(discrete = TRUE)+
+  viridis::scale_color_viridis(discrete = TRUE)+
+  labs(title = "LDA results",
+       x = "Variable of Interest",
+       y = "Result",
+       subtitle = "10 replications of 10-fold cross validation",
+       legend = "Feature Genes",
+       caption = "For the BRAF/NRAS/PTEN/wt cases the result shown is the percentage of correctly classified cases") +
+  theme(plot.caption=element_text(hjust = -0.01))
+```
+
+
+```{r LDA mutations optimization}
+#To see if we can find a better combination of genes as selectors
+# we run with the direct contrasts but including one other
+# Previous accuracy 0.652
+
+lda.optim <- function(features, extra.features, df){
+  accuracy = NULL
+  for(i in 1:length(extra.features)){
+    new.features = unique(c(features, extra.features[i]))
+    set.seed(1)
+    accuracy[i] = mean((replicate(5, {
+        samples.index = c( which(df$Mutation != "BRAF"), 
+                    sample( which(df$Mutation == "BRAF"), 22))     
+        cvlda( df[samples.index,c("Mutation", new.features)], 10)
+      }))[1,])
+  }
+  return(c(extra.features[which.max(accuracy)], max(accuracy)))
+}
+
+lda.optim.auto <- function( features, extra.features, df){
+  v1 = NULL
+  v2 = NULL
+  optim.features = features
+  candidate.features = extra.features
+  for( i in 1:20) {
+    tmp <- lda.optim(optim.features, candidate.features, df)
+    v1[i] <- tmp[1]
+    v2[i] <- as.numeric(tmp[2])
+    optim.features <- c(optim.features, v1[i])
+    candidate.features = candidate.features[which(candidate.features != v1[i])]
+  }
+  return(data.frame(Gene = v1, Accuracy = v2, stringsAsFactors = FALSE))
+}
+
+# system.time(
+#   feature.genes.optim <- lda.optim.auto(features = feature.genes[[1]], 
+#       extra.features = feature.genes[[2]][-which(feature.genes[[2]] %in% feature.genes[[1]])],
+#                                 df = df_main))   #3.4 hours
+
+#write.csv(feature.genes.optim2, file.path(data.dir, "feature_genes_mutations.csv"), quote = FALSE)
+tmp <- read.csv(file.path(data.dir, "feature_genes_mutations.csv"),
+                                    stringsAsFactors = FALSE)%>% 
+  dplyr::select(Gene, Accuracy) %>% 
+  bind_rows(data.frame(Gene = "Initial", 
+                       Accuracy = mean(lda.results[1:10,1]), stringsAsFactors = FALSE),.)
+
+feature.genes.mutations <- tmp  %>% 
+  mutate(Nfeatures = c(4:(dim(tmp)[1]+3))) %>% 
+  mutate(Accuracy = as.numeric(format(Accuracy*100, digits = 4)))
+
+ggplot(data = feature.genes.mutations, aes(Nfeatures, Accuracy))+
+  geom_point(alpha = 0.7)+
+  geom_point(data = feature.genes.mutations[which.max(feature.genes.mutations$Accuracy),],
+             aes(Nfeatures, Accuracy), col = "red")+
+  ggrepel::geom_label_repel(data = feature.genes.mutations[which.max(feature.genes.mutations$Accuracy),],
+             aes(Nfeatures, Accuracy, label = Accuracy))+
+  geom_smooth(method = "loess")+
+  labs(title = "Accuracy of LDA",
+       subtitle = "Based on number of features (genes)")
+
+```

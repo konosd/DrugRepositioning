@@ -1,0 +1,498 @@
+---
+title: "Melanoma cell lines: Differential Gene Expression"
+author: "Kostas Ntagiantas"
+date: "June 25, 2018"
+output: html_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(eval = TRUE, echo = FALSE, results = "hide", warning = 
+                        FALSE, message = FALSE, cache.lazy = FALSE, fig.align = 
+                        "center" , cache = FALSE)
+library(knitr)
+library(tidyverse)
+library(limma)
+
+code.name <- "DEGs" 
+data.dir <- file.path(getwd(), "data", code.name)
+results.dir <- file.path(getwd(), "results", code.name)
+experiment <- c("GSE7127", "GSE36133", "GSE22301", "GSE35388")
+
+pheno.global <- readRDS(file.path(data.dir,"pheno_global.rds"))
+global.exp.corrected <- readRDS(file.path(data.dir,"global_exp_corrected.rds") )
+df.pca.corrected <- readRDS(file.path(data.dir,"df_pca_corrected.rds") )
+source(file.path(getwd(), "code", "limma_top_table.R"))
+
+#Pre loading the results of THIS script for easy report generation
+genes.mel.healthy <- readRDS(file.path(data.dir, "genes_mel_healthy.rds"))
+genes.mut.healthy <- readRDS(file.path(data.dir, "genes_mut_healthy.rds"))
+genes.mut.mut <- readRDS(file.path(data.dir, "genes_mut_mut.rds"))
+
+```
+
+#Introduction
+
+In order to find the differentially expressed genes (DEGs), the first thing to take into account is the balance of the data; there are only 6 healthy cell lines vs. 144 melanoma samples, two orders of magnitude higher. This leads to the need to balance the data, in order to get accurate p values from the t tests used to find the significantly different genes. 
+Furthermore, based on the integrated data, we can see that in the PCA space, the variance between the melanoma cells is great; a smart approach on sampling is necessary to arrive at a reliable result.
+
+To overcome the problem of randomness from taking a subgroup of melanoma samples to test vs healthy cells, the procedure is replicated 1000 times, with different samples every time. In each replication, the genes with p-value smaller than 0.05 and |logFC|>1 are saved. At the end of the simulation, the genes are ranked based on the number of the replications in which they are considered differential.
+
+#Melanoma VS. Healthy
+First, the only contrast used is Melanoma-Healthy. 
+The sampling for the melanoma cell lines is first done globally, and then respectively to the clusters that are created from PCA. In the latter approach, the genes found are significantly different from cluster to cluster, and could be used to differentiate between them.
+
+```{r DEGs Melanoma VS Healthy, eval = FALSE, include = FALSE}
+genes.mel.healthy <- list()
+#The genes that are of interest right now are those with differential expression
+# between control and melanoma cells
+set.seed(1)
+ngenes = replicate( 1000,  {
+  
+  
+index = c( which( pheno.global$Status %in% c("Control", "Immortalized")),
+            sample( which(pheno.global$Status == "Melanoma"), 
+                    6, replace = FALSE))
+
+tmp = limma.top.table(name = paste("Melanomas",
+                                   paste(as.character(tail(index,6)), 
+                                                     collapse = "-") ),
+                dfactor = factor(gsub("Immortalized", "Control", 
+                               pheno.global$Status[index])),
+                expression = global.exp.corrected[,c(1,index+1)] ,
+                contrast.vector = "Melanoma-Control")
+
+tmp = tmp[[1]] %>% filter(adj.P.Val < 0.05, abs(logFC) > 1) %>% #nrow()
+  dplyr::select( ID, logFC, t, adj.P.Val) %>% 
+  mutate(MelCells = paste(as.character(tail(index,6)), collapse = "-"))
+return(tmp)
+})
+
+genes.mel.healthy[[1]] <- apply(X = ngenes, MARGIN = 1, FUN = unlist) %>% 
+  as.data.frame(., stringsAsFactors = FALSE) %>% 
+  mutate(logFC = as.double(logFC), 
+         t = as.double(t),
+         adj.P.Val = as.double(adj.P.Val),
+         Set = "From all") 
+rm(ngenes)
+
+finding.degs <- function( cluster) {
+  set.seed(1)
+    ngenes = replicate( 1000,  {
+      
+      
+    index = c( which( pheno.global$Status %in% c("Control", "Immortalized")),
+                sample( which(pheno.global$Status == "Melanoma" &
+                              df.pca.corrected$Cluster == cluster), 
+                        6, replace = FALSE))
+    
+    tmp = limma.top.table(name = paste("Melanomas",
+                                       paste(as.character(tail(index,6)), 
+                                                         collapse = "-") ),
+                    dfactor = factor(gsub("Immortalized", "Control", 
+                                   pheno.global$Status[index])),
+                    expression = global.exp.corrected[,c(1,index+1)] ,
+                    contrast.vector = "Melanoma-Control")
+    
+    tmp = tmp[[1]] %>% filter(adj.P.Val < 0.05, abs(logFC) > 1) %>% #nrow()
+  dplyr::select( ID, logFC, t, adj.P.Val) %>% 
+  mutate(MelCells = paste(as.character(tail(index,6)), collapse = "-"))
+    return(tmp)
+    })
+  ngenes <- apply(X = ngenes, MARGIN = 1, FUN = unlist) %>% 
+  as.data.frame(., stringsAsFactors = FALSE) %>% 
+  mutate(logFC = as.double(logFC), 
+         t = as.double(t),
+         adj.P.Val = as.double(adj.P.Val),
+         Set = paste("From cluster",cluster)) 
+  return(ngenes)  
+}
+
+
+tmp <- lapply( X = c(1:6) , FUN = finding.degs )
+genes.mel.healthy[2:7] <- tmp ;  #rm(tmp)
+names(genes.mel.healthy) <- c("From all",paste( "From cluster", 1:6))
+genes.mel.healthy <- purrr::reduce(.x = diff.exp.genes, .f = bind_rows) %>% as.data.frame(.)
+
+#this chunk returns the list "diff.exp.genes", with 7 slots, each one including the degs found as differentially expressed at least in one iteration, for the 6 clusters of melanoma cells and  for all the melanoma cells
+saveRDS(object = diff.exp.genes, file = file.path(data.dir, "diff_exp_genes.rds"))
+```
+
+```{r DEGs Melanoma VS Healthy threshold}
+# genes.mel.healthy <- readRDS(file.path(data.dir, "genes_mel_healthy.rds")) %>% 
+#   dplyr::rename(Gene = ID)
+
+niters.wrap <- function(df){
+ niters = function(ngenes,x) {sum(ngenes>=x)}
+ iters = c(1:1000)
+ filt = df$Set %>% unique
+ result = NULL
+ for( i in 1:length(filt)){
+ tmp = data.frame(Niters = iters,
+                 Ngenes = sapply(iters, FUN = niters, 
+                                 ngenes =filter(df, Set == filt[i])$n),
+                 Set = as.character(filt[i]), stringsAsFactors = FALSE)
+ result = bind_rows(result, tmp)
+ }
+ return(result)
+}
+
+tmp <- genes.mel.healthy %>% group_by(Set, Gene) %>% summarise(n = n() )
+
+df <- niters.wrap(tmp)
+
+ggplot( data = df, aes(Niters, Ngenes, group = Set, color = Set, fill = Set)) +
+  geom_area(alpha = 0.2, position = "identity")+
+  #stat_density(alpha = 0.3, geom = "density" ) +
+  viridis::scale_color_viridis(discrete = TRUE) + 
+  viridis::scale_fill_viridis(discrete = TRUE) +  
+  labs( title = "Significant genes threshold selection",
+        x = "N Iterations or more",
+        y = "Number of Genes")
+```
+
+The figure above indicates that the results of the differential analysis in every iteration are robust, as the majority of the genes is present in most iterations. Furthermore, it can be seen that for the simulation where the samples are taken across all clusters (set 1), there are no genes present in all of the iterations. This makes sense as the melanoma cell lines are widely distributed across the PCA space. 
+Three thresholds are chosen: **260 - 540 - 800 iterations** or more. Sensitivity analysis based on the results downstream will help identify the best selection of the three.
+
+```{r DEGs Melanoma VS Healthy EDA threshold}
+
+threshold <- c(260,540,800) #c("lax", "medium", "strict")
+df <- threshold %>% lapply(. %>% {filter(tmp, n>.)}) %>% 
+  map2_df( .x = ., c("lax", "medium", "strict"),
+                            ~mutate(.x, Threshold = .y)) 
+
+threshold.plots <- list()
+threshold.plots[[1]] <- ggplot(data = df, 
+                                aes(Set, fill = Threshold)) +
+  geom_bar(alpha = 0.7,position = "dodge") +
+  #geom_text(aes(label = Set), vjust = -0.1)+
+  theme(axis.text.x = element_text(angle = 45))+
+  labs(title = "DEGs in every case",
+       y = "")
+
+threshold.plots[[1]]
+
+tmp <- df %>% group_by(Threshold, Gene) %>% summarize(PresentIn = n() ) %>% 
+  summarize(TotalGenes = n())
+threshold.plots[[2]] <- ggplot(tmp, 
+                                aes(Threshold, TotalGenes, fill = Threshold))+
+    geom_bar(alpha = 0.7, stat= "identity") +
+    geom_text(aes(label = TotalGenes), vjust = -0.1)
+  
+threshold.plots[[2]]
+```
+
+After selecting the three sets of differentially expressed genes according to the threshold, the goal is to use genes as predictors about the state of the cell. A good predictive model uses these genes to classify a cell between a healthy melanocyte and a cancerous melanoma cells. Therefore, the best predictors are genes that have been found as differentially expressed in all clusters. There are seven simulations, six of them are sampling cells from the six cancer clusters, and one that is sampling from all cancer clusters. PCA has shown great diversity of cancer cells. It is imperative that three different cases are studied:
+
+1.**Case 1**:DEGs present in all seven simulations.
+2.**Case 2**:DEGs present in the six simulations of the six clusters respectively
+3.**Case 3**:DEGs present in the last simulation where sampling is across all melanoma samples.
+
+```{r DEGs Melanoma VS Healthy three cases plot}
+
+tmp <- purrr::reduce( list(
+df %>% group_by(Threshold, Gene) %>% summarise(PresentIn = n() ) %>% 
+  filter(PresentIn == 7) %>% summarise(Genes = n() ) %>% mutate( Case = "Case1")
+,
+df %>% filter(Set != "From all") %>%
+  group_by(Threshold, Gene) %>% summarise(PresentIn = n() ) %>% 
+  filter(PresentIn == 6) %>% summarise(Genes = n() ) %>% mutate( Case = "Case2")
+,
+df %>% filter(Set == "From all") %>% 
+  group_by(Threshold, Gene) %>% summarise(PresentIn = n() ) %>% 
+  summarise( Genes = n() ) %>% mutate( Case = "Case3")
+), bind_rows)
+
+ggplot(data = tmp, aes(Case, Genes, fill = Threshold)) +
+  geom_bar(alpha = 0.7, position = "dodge", stat = "identity")+
+  geom_text(aes(label = Genes), vjust= -0.1, position = position_dodge(width = 1))+
+  labs(title = "DEGs for the three different cases")
+
+```
+
+```{r DEGs Melanoma VS Healthy three cases venn, eval = FALSE, include = FALSE}
+library(VennDiagram)
+threshold <- c("lax", "medium", "strict")
+for(i in 1:3){
+  index = threshold[i]
+  venn.diagram(x = list(
+    df %>% filter(Threshold == index) %>% group_by(Gene) %>% 
+      summarise(PresentIn = n() ) %>% 
+      filter(PresentIn ==7) %>% .$Gene
+    ,
+    df %>% filter(Threshold == index, Set != "From all" ) %>% group_by(Gene) %>% 
+      summarise(PresentIn = n() ) %>% 
+      filter(PresentIn ==6) %>% .$Gene
+    ,
+    df %>% filter(Threshold == index,Set == "From all") %>% .$Gene), 
+    filename = file.path(results.dir,paste("Venn_",index,".png",sep = "")),
+     category.names = paste(index,",Case", c(1:3)),cat.cex = 0.2, cex = 0.2,lwd = 0.4,
+     fill = c("darkblue", "darkred", "darkmagenta"), 
+     alpha = rep(0.3,3),imagetype = "png",height = 400, width = 400,
+    cat.dist = 0.01)
+}
+```
+
+**Venn diagrams for the three different cases and each threshold**
+
+```{r DEGs Melanoma VS Healthy three cases venn PLOT,out.width='100%'}
+knitr::include_graphics(path = file.path(results.dir, "Venn_lax.png"))
+knitr::include_graphics(path = file.path(results.dir, "Venn_medium.png"))
+knitr::include_graphics(path = file.path(results.dir, "Venn_strict.png"))
+
+```
+
+![](C:/Users/Konstantinos/Desktop/melan/results/DEGs/Venn_lax.png) ![](C:/Users/Konstantinos/Desktop/melan/results/DEGs/Venn_medium.png) ![](C:/Users/Konstantinos/Desktop/melan/results/DEGs/Venn_strict.png)
+
+
+The diagrams above show that except for case 3, especially with a lax threshold, most genes are common between the three cases. The first and second case, with the exception of 2 and 1 genes for lax and medium threshold respectively, contain exaclty the same genes. 
+
+#Contrasting between different mutations
+
+Now that the case of melanoma samples versus human melanocytes is done, the genes that define the various mutations have to be found. For this two cases are considered:
+
+1. BRAF (+NRAS + PTEN) VS wild type VS Healthy
+2. BRAF VS NRAS VS PTEN
+
+The samples are distributed as follows across the different categories:
+
+BRAF  | NRAS  | PTEN  | wt  | Control
+--- | --- | --- | --- | ---
+84  | 22  | 16  | 22  | 6
+
+It has to be noted that all cell lines that bear the PTEN mutation and one that bears the NRAS mutation also have the BRAF mutation in the particular dataset that is being studied. 
+
+Now that we wee need to find differences between mutations, we see that the samples are not so imbalanced as in the case of melanoma vs healthy. Therefore there is no need to have the iterative process in order to filter the truly differentially expressed genes.
+
+```{r Key Mutations Plot } 
+# pheno.global <- read.table("global_phenotype.txt", header = TRUE, sep = "\t", 
+#                   stringsAsFactors = FALSE)
+# df.pca.corrected <- cbind( as.data.frame( pca.corrected$x), pheno.global) %>% 
+#   cbind(data.frame(Cluster = as.character(clusterCut)))
+
+#Function to get the hulls
+convex_hull <- function(df) df[chull(df$PC1, df$PC2), ]
+hulls <- df.pca.corrected %>% 
+  group_by( Cluster ) %>% do( convex_hull(.) ) %>% as.data.frame(.)
+
+#Plotting to see clusters opposed to mutations
+ggplot( data = df.pca.corrected, 
+        aes(PC1, PC2, shape = Status, color = Mutation, fill = Mutation)) +
+  geom_point(alpha = 1) +
+  geom_polygon(data = hulls, aes( x=PC1, y=PC2, group=Cluster), 
+               show.legend = FALSE, alpha = 0.05, inherit.aes = FALSE) +
+  scale_color_brewer(type = "qual", palette = "Dark2") + 
+  labs( title = "Key mutations of the cell lines", 
+        x = "PC1",
+        y = "PC2",
+        subtitle = "Cluster anglomeration method = 'Complete'") + 
+  theme(plot.caption = element_text(hjust = -0.1))
+
+```
+
+```{r DEGs of key mutations setup}
+pheno.global <- pheno.global %>% 
+  mutate( Mutation = gsub(".*NRAS", "NRAS", Mutation)) %>% 
+  mutate( Mutation = gsub(".*PTEN", "PTEN", Mutation)) %>% 
+  mutate( Mutation = gsub("immortal", "control", Mutation))
+  
+contrast.vector <- pheno.global$Mutation %>% 
+  factor(.) %>% levels(.) %>% combn(x = ., m = 2) %>% 
+  t(.) %>% as.data.frame(.) %>% 
+  mutate(Contrast = paste(V1, V2, sep = "-")) %>% .$Contrast
+#Choosing the contrasts we want, firs control vs everything.
+contrast.vector <- contrast.vector[grep("control",contrast.vector)]
+
+finding.degs <- function(repetitions, contrastvector) {
+  set.seed(1)
+  sample.size = min((table(pheno.global$Mutation)))
+  
+  genes = replicate( n = repetitions, expr = {
+    population = pheno.global %>% 
+      group_by(Mutation) %>% sample_n(sample.size) %>% .$geo_accession
+    index = which(pheno.global$geo_accession %in% population)
+    dfactor = factor(pheno.global$Mutation[index])
+    
+    limma.tests = limma.top.table(name = "Key Mutations",dfactor = dfactor, 
+                                   expression = global.exp.corrected[,c(1,index+1)],
+                                   contrast.vector = contrastvector)
+    diff.genes = lapply( limma.tests, filter,  
+                                adj.P.Val < 0.05 & abs(logFC)>1) %>% 
+      lapply(X =., select, ID, logFC, t, adj.P.Val) 
+      
+      return(diff.genes)
+  })
+  l = length(contrastvector)
+  contrast.list <- vector("list",l)
+  for(i in 1:l){
+    contrast.list[[i]] <- purrr::reduce(.x = genes[i,], .f = bind_rows) 
+  }
+  names(contrast.list) <- contrastvector
+  return(contrast.list)
+}
+```
+
+```{r DEGs mutations vs healthy, eval = FALSE, include =  FALSE}
+tmp <- finding.degs(repetitions = 1000, contrast.vector) #8 minutes
+
+
+genes.mut.healthy <- tmp %>% 
+  map2_df(.x = ., .y = names(tmp), ~mutate(.x, Set = .y))
+  
+
+write.csv(genes.mut.healthy, 
+          file.path(data.dir,"mutations_vs_healthy_keygenes.csv"), quote = FALSE)
+#this chunk produces the key.genes dataframe, thatincludes all genes that have been found to be differentially expressed in all iterations for all of the 10 contrasts.
+```
+
+```{r DEGs mutations vs healthy plots}
+#genes.mut.healthy <- readRDS(file.path(data.dir,"genes_mut_healthy.rds"))
+genes.mut.healthy.plots <- list() 
+
+
+tmp <- genes.mut.healthy %>% group_by(Set, Gene) %>% 
+  summarise(Appearances = n() ) %>% summarise(Ngenes = n() )
+genes.mut.healthy.plots[[1]] <- ggplot(tmp,
+       aes(Set, Ngenes, fill = Set))+
+  geom_bar(show.legend = FALSE, alpha = 0.7, stat = "identity")+
+  geom_text(aes(label = Ngenes), vjust = -0.1)+
+  theme(axis.text.x = element_text(angle = 90))+
+  scale_y_continuous(limits = c(0,4100))+
+  labs( y = "N",
+        subtitle = "Mutations vs. Healthy vs. Wild-type")
+
+# genes.mut.healthy.plots[[1]] 
+
+
+```
+
+It is obvious that the cell lines that bear the three melanoma mutations have a lot in common, as the number of genes that are differentially expressed, even after an analysis of 1000 simulations is greatly smaller than the genes in when contrasting the mutant cells to healthy melanocytes but also to wild type melanoma cells.
+
+To find the genes that define the two cases of contrasts mentioned above it is imperative to find the difference between the various sets. That is, find the genes that are differentially expressed exclusively in every set. 
+
+```{r DEGs mutation vs healthy threshold}
+tmp <- genes.mut.healthy %>% group_by(Set, Gene) %>% summarise(n = n() )
+
+df <- niters.wrap(tmp)
+  
+tmp <- df %>% group_by(Set) %>% 
+  filter(Ngenes == min(Ngenes)) %>% summarise(MaxIterations = min(Niters)) %>% 
+  as.data.frame()
+
+genes.mut.healthy.plots[[2]] <- ggplot( data = tmp
+                      , aes(x = Set,y = MaxIterations, fill = Set)) +
+  geom_bar(alpha = 0.7,show.legend = FALSE, stat = "identity")+
+  geom_text(aes(label = MaxIterations), vjust = -0.2)+
+  theme(axis.text.x = element_text(angle = 90))+
+  scale_y_continuous(limits = c(0,1100))+
+  labs( subtitle = "Mutations vs. Healthy")
+
+do.call(gridExtra::grid.arrange,c(genes.mut.healthy.plots, ncol = 2))
+
+
+ggplot( data = df,
+        aes(Niters, Ngenes, group = Set, fill = Set, color = Set)) +
+  geom_area(alpha = 0.2, position = "identity")+
+  viridis::scale_color_viridis(discrete = TRUE) + 
+  viridis::scale_fill_viridis(discrete = TRUE) +  
+  coord_cartesian(ylim = c(0,1000))+
+  labs( title = "Significant genes threshold selection",
+        x = "N Iterations or more",
+        y = "Number of Genes")
+
+df <- genes.mut.healthy %>% group_by(Set, Gene) %>% summarise(n = n() )
+
+
+tmp <- bind_rows( data.frame(df %>% filter(n>260) %>% 
+  summarise(Ngenes = n() ) %>% mutate(Threshold = "lax")),
+  data.frame(df %>% filter(n>540) %>% 
+  summarise(Ngenes = n() ) %>% mutate(Threshold = "medium")),
+  data.frame(df %>% filter(n>800) %>% 
+  summarise(Ngenes = n() ) %>% mutate(Threshold = "strict")))
+  
+  
+ggplot( data = tmp, aes(Set, Ngenes, fill = Threshold))+
+  geom_bar(alpha = 0.7, show.legend = FALSE, position = "dodge",stat = "identity")+
+  geom_text(aes(label = Ngenes), vjust= -0.1, position = position_dodge(width = 1) )+
+  labs(title = "DEGs respetive to iteration threshold",
+       x = "Set", y = "Number of Genes",
+       subtitle = "Lax = 260 iter., Medium = 540 iter., Strict = 8000.iter")
+
+```
+
+The results of the simulation that are shown above are expected: All the cases of melanoma cell lines (BRAF/NRAS/PTEN/wild type) are contrasted to healthy melanocytes have differentially expressed genes that are present in the majority of the iterations ( 988, 1000, 1000, 874 iterations out of 1000 respectively). Furthermore, the number of differentially expressed genes among the various melanoma mutations can be assumed to be zero, as there are at most 188 iterations that share differentially expressed genes.
+
+If we compare the threshold selection figures for the melanoma-healthy contrasts when sampling by cluster and when sampling by mutation, we see that the analysis is much more robust when sampling from the same cluster instead of sampling from the same mutation. This is explained by the high in-set variance in each mutation group.
+
+```{r DEGs mutation vs mutation}
+index <- which(pheno.global$Mutation != "control")
+
+contrast.vector <- pheno.global$Mutation[index] %>% 
+  factor(.) %>% levels(.) %>% combn(x = ., m = 2) %>% 
+  t(.) %>% as.data.frame(.) %>% 
+  mutate(Contrast = paste(V1, V2, sep = "-")) %>% .$Contrast
+
+genes.mut.mut <- limma.top.table(name = "MutVsMut", 
+                                 dfactor = factor(pheno.global$Mutation[index]),
+                                 expression = global.exp.corrected[,c(1,index+1)],
+                                 contrast.vector = contrast.vector)
+genes.mut.mut <- genes.mut.mut %>% 
+#  lapply(. %>% filter(.,adj.P.Val<0.05 & abs(logFC) >1)) %>% 
+  map2_df(.x = ., .y = contrast.vector, ~mutate(.x, Set = .y)) %>% 
+  dplyr::rename(Gene = ID)
+
+
+```
+
+```{r DEGs mutation vs mutation plots}
+
+df <- genes.mut.mut %>% filter(adj.P.Val < 0.05 & abs(logFC) >1 ) %>% 
+  dplyr::select(Gene, Set)
+
+tmp <- df %>% group_by(Set) %>% summarise(Ngenes = n() )
+ggplot(data = tmp, aes(Set, Ngenes, fill = Set))+
+  geom_bar(show.legend = FALSE, alpha = 0.7, stat = "identity")+
+  geom_text(aes(label = Ngenes), vjust = -0.1)+
+  theme(axis.text.x = element_text(angle = 30))+
+  labs( y = "DEGs",
+        subtitle = "Mutations vs. Mutations")
+
+```
+
+```{r DEGs mutation vs mutation venn diagrams, eval = FALSE, include = FALSE}
+library(VennDiagram)
+venn.diagram(x = list(
+  filter(df, Set == "BRAF-wt")$Ngenes,
+  filter(df, Set == "NRAS-wt")$Ngenes,
+  filter(df, Set == "PTEN-wt")$Ngenes), file.path(results.dir,"mutVSwt.png"),
+  category.names = c("BRAF-wt", "NRAS-wt", "PTEN-wt"),
+  fill = c("darkblue", "darkred", "darkmagenta"), alpha = rep(0.3,3),imagetype = "png")
+```
+
+```{r DEGs mutation vs mutation venn diagrams PLOT, fig.cap="Mutations vs. wt", out.width='100%'}
+
+knitr::include_graphics(path = file.path(results.dir,"mutVSwt.png"))
+
+```
+
+![Mutations vs. wt](C:/Users/Konstantinos/Desktop/melan/results/DEGs/mutVSwt.png)
+
+```{r DEGs presented and tidied up}
+#The genes we havw found after the analysis are the following and in the following objects:
+# 1.    DEGs from all melanomas vs all controls are filtered through thresholds and are in 
+head(genes.mel.healthy)
+# 2.    Degs from every mutation against the controls are NOT filtered through 
+#       threshold selection and are in
+head(genes.mut.healthy)
+# 3.    Degs from every mutation against every mutation, in LIMMA TABLES WITH ALL INFO  
+head(genes.mut.mut)
+```
+
+```{r Saving results, eval = FALSE, include = FALSE}
+
+saveRDS(genes.mel.healthy, file.path(data.dir, "genes_mel_healthy.rds"))
+saveRDS(genes.mut.healthy, file.path(data.dir, "genes_mut_healthy.rds"))
+saveRDS(genes.mut.mut, file.path(data.dir, "genes_mut_mut.rds"))
+
+```
+
+Now that we have found the DEGs of every contrast, using iterative and filtering process for the unbalanced case of contrasting with noraml melanocytes and normal t-testing with multiple-testing correction when contrasting within the mutations, as the samples are more balanced there. 

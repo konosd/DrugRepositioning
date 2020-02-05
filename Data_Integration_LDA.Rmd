@@ -1,0 +1,873 @@
+---
+title: "Melanoma cell lines: Data integration and LDA"
+author: "Kostas Ntagiantas"
+date: "June 25, 2018"
+output: html_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(eval = TRUE, echo = FALSE, results = "hide", warning = 
+                        FALSE, message = FALSE, cache.lazy = FALSE, fig.align = 
+                        "center" , cache = FALSE)
+library(knitr)
+library(tidyverse)
+
+code.name <- "Data_Integration_LDA" 
+data.dir <- file.path(getwd(), "data", code.name)
+results.dir <- file.path(getwd(), "results", code.name)
+
+experiment <- c("GSE7127", "GSE36133", "GSE22301", "GSE35388")
+
+#load("melan.RData")
+
+```
+
+The goal of this project is to integrate data from various experiment in an effort to get a better perspective of how melanoma cancerous cells proliferate, as well as build a profile of the disease with crucial genes and pathways that define it and distinguish several key cell lines from normal melanocyte cells. One issue that can be solved by the integration is the use of control melanocytes from across experiments. Therefore, the cell lines of the CCLE database, can now be included in a differential gene analysis with control melanocytes from other experiments.
+
+## Datasets
+
+All data used in this report were downloaded as CEL files from GEO database and converted to datasets with the rma method of **limma** package, with the exception of the CCLE data that was downloaded directly from the legacy portal of the CCLE website, that were already processed with the same rma algorithm.
+Each expressionset is saved as an *.rds* file and loaded in the workspace. The expression matrices are also saved and loaded to reduce compilation time.
+
+Experiment  |   Data
+--- | --- 
+GSE7127 | 63 melanoma cell lines
+GSE36133  | CCLE with many melanoma cell lines
+GSE22301  | Melanoma cell lines & 4 melanocytes
+GSE35388  | Melanoma cell line A375 & two melanocytes
+
+From those datasets, we extract only the expression matrix and the phenotype dataframe that will help with the batch effect detection.
+All of the cell lines in the CCLE datasets are cases of malignant melanoma.
+The cancerous cells, for the sake of this project, were all trated like cases of malignant melanoma.
+
+```{r Data Import, eval = FALSE, include = FALSE}
+# GSE7127 has 63 melanoma cell lines with known key mutation.
+# GSE36133 is the CCLE dataset. We'll later keep only the melanoma lines.
+
+## Import functions-------------------------------------------------------------
+# function createExpressionSet needs CEL files in directory
+createExpressionSet <- function( experiment ) {
+  require(affy)
+  path = file.path( data.dir, experiment )
+  filenames = list.files( path , full.names = TRUE,pattern = ".*CEL")
+  affy = read.affybatch(filenames = filenames)
+  return( rma( affy ))
+}
+
+#function probe2gene maps each probe to its gene
+library(AnnotationDbi)
+probe2gene <- function( expression.set , database) {
+  require( AnnotationDbi )
+  require(tidyverse)
+  df = AnnotationDbi::select( x = database, 
+                              keys = rownames(Biobase::exprs(expression.set)),
+                              columns = c("ENTREZID", "SYMBOL"), 
+                              keytype = "PROBEID")
+  df = group_by( df, PROBEID )%>% 
+    summarise(SYMBOL = paste(SYMBOL, collapse = " /// "), 
+              ENTREZID = paste(ENTREZID, collapse = " /// ")) %>% 
+    as.data.frame(.) %>% column_to_rownames("PROBEID")
+  return(df)
+}
+
+#function make.expression.matrix aggregates by gene
+#and calculates the mean expression. Column "Gene" is first
+#and ENTREZ gene ID's are used as rownames for easy access to both annotations.
+make.expression.matrix <- function( expression.set ) {
+  require(Biobase)
+  require(tidyverse)
+  mat = Biobase::exprs( expression.set ) %>% 
+    aggregate( 
+      by = list(expression.set@featureData@data$SYMBOL), FUN = mean) %>% 
+    rename_( "SYMBOL" = "Group.1") %>% 
+    filter(!grepl("///", SYMBOL)) 
+  
+  tmp = semi_join( expression.set@featureData@data , 
+                   mat, by = "SYMBOL") %>% 
+    filter(! duplicated(SYMBOL))
+  rownames(mat) = tmp$ENTREZID
+  return(mat)  
+}
+
+##Extracting expression matrix and df ---------------
+
+#If you need the preprocessed data from GEO,
+# they're stored as "geoDatasets.rds", in your directory
+geo.sets <- readRDS(file.path(data.dir,"geoDatasets.rds") )
+
+exp.matrix <- list()
+pheno.df <- list()
+exp.set <- list()
+
+exp.set[[1]] <- createExpressionSet( experiment[1])
+library(hgu133plus2.db)
+exp.set[[1]]@featureData@data <- probe2gene( exp.set[[1]], hgu133plus2.db)
+
+#Check to see if correct - all must be TRUE
+identical( colnames( exp.set[[1]]), 
+          paste( rownames(geo.sets[[1]]@phenoData), ".CEL.gz", sep = "" ))
+
+#attaching phenotype data from GEO sets
+exp.set[[1]]@phenoData <- geo.sets$GSE7127@phenoData
+
+#Filter expression matrix and phenodataframe
+exp.matrix[[1]] <- make.expression.matrix( exp.set[[1]] )
+pheno.df[[1]] <- pData(exp.set[[1]]) %>% dplyr::select(title, geo_accession) %>% 
+  mutate(title = gsub(pattern = "Melanoma cell line |melanoma cell line", 
+                      replacement = "", title), Experiment = experiment[1], 
+         Status = "Melanoma", Histology = "Melanoma", Platform = "hgu133+2" )
+
+#Second experiment is downloaded directly from Broad Institute's site
+# exp.matrix[[2]] <- read_tsv(file = paste(experiment[2],
+#                              "/CCLE_Expression_Entrez_2012-09-29.gct",
+#                              sep = "")) %>%
+exp.matrix[[2]] <- read_tsv(file = file.path(data.dir,experiment[2],
+                             "CCLE_Expression_Entrez_2012-09-29.gct")) %>%
+  as.data.frame(.) %>% mutate(Name = gsub(pattern = "_at", replacement = "",
+                                          Name)) %>% 
+  column_to_rownames(var = "Name") %>% dplyr::rename( Symbol = Description)
+#Pheno data
+tmp <- read_tsv(file = file.path(data.dir,experiment[2],
+                             "CCLE_sample_info_file_2012-10-18.txt")) %>% 
+  as.data.frame(.) %>% 
+  dplyr::select(`CCLE name`,`Cell line primary name`, `Histology`)
+
+#Index to select melanoma samples
+index<- which( grepl(pattern = "melanoma", tmp$Histology) )
+cell.lines.ccle <- tmp$`CCLE name`[index]
+exp.matrix[[2]] <- exp.matrix[[2]] %>% 
+  dplyr::select(Symbol, cell.lines.ccle) 
+
+#Indexing and filtering only melanoma from the phenoframe
+pheno.df[[2]] <- tmp[index,-which(colnames(tmp) == "CCLE name")] %>% 
+  mutate(Experiment = experiment[2],
+         Status = "Melanoma", 
+         Histology = gsub("malignant_melanoma", 
+                          "Malignant Melanoma", Histology),
+         Platform = "hgu133+2_ENTREZGv15") %>% 
+  dplyr::rename( title = `Cell line primary name`); rm(tmp,index,cell.lines.ccle)
+
+# Now extracting data from the GSE22301-35388 datasets
+#library(GEOquery)
+# First the preprocessed GEO datasets for the phenotype
+#geo.sets[[3]] <- getGEO(experiment[3], GSEMatrix = TRUE)[[1]]
+#geo.sets[[4]] <- getGEO(experiment[4], GSEMatrix = TRUE)[[1]]
+
+#Now making the expression sets, matrices and phenoframes
+exp.set[[3]] <- createExpressionSet( experiment[[3]])
+library(hgu133a2.db)
+exp.set[[3]]@featureData@data <- probe2gene( exp.set[[3]], hgu133a2.db)
+exp.matrix[[3]] <- make.expression.matrix( exp.set[[3]] )
+
+exp.set[[4]] <- createExpressionSet( experiment[[4]])
+library(hgu133plus2.db)
+exp.set[[4]]@featureData@data <- probe2gene( exp.set[[4]], hgu133plus2.db)
+exp.matrix[[4]] <- make.expression.matrix( exp.set[[4]] )
+
+#Phenoframes
+pheno.df[[3]] <- geo.sets[[3]]@phenoData@data %>% 
+  dplyr::select(36,2,37) %>%  
+  dplyr::rename(Histology = `histological subtype:ch1`, 
+                title = `cell line:ch1`)%>%
+  mutate( Experiment = experiment[3],
+          title =gsub(pattern = ".*, ", replacement = "", title),
+          Platform = "hgu133a2",
+          Status = gsub(".*melanoma", "Melanoma", Histology))
+pheno.df[[3]]$Status[2:3] <- rep("Immortalized", 2)  
+
+pheno.df[[4]] <- geo.sets[[4]]@phenoData@data %>% 
+  dplyr::select(39,2,38,40) %>% 
+  dplyr::rename(title = `cell line:ch1`, Status = `cancer status:ch1`, 
+                Type = `sample type:ch1`) %>% 
+  mutate( Status = gsub("Normal.*", "Melanocyte control", Status),
+          Histology = Status, Experiment = experiment[4],
+          Platform = "hgu133+2") 
+
+# For experiment 4 we only need the data that belong to samples inside the cell 
+# and not the exosomes, so indexing and filtering accordingly
+index <- which( pheno.df[[4]]$Type == "cell")
+pheno.df[[4]] <- pheno.df[[4]][index,] %>% dplyr::select(-4)
+exp.matrix[[4]] <- exp.matrix[[4]][,c(1,index+1)] ; rm(index)
+
+#Reorder the phenoframe columns to look pretty
+for(i in 1:length(experiment)){
+pheno.df[[i]]<-pheno.df[[i]][,order(colnames(pheno.df[[i]]), decreasing = TRUE)]
+} ; rm(i)
+
+
+```
+
+## Data integration
+
+First, the genes that are not present across all expression matrices are filtered out of the datasets. Then, the fold changes of the genes in the two datasets that involve melanoma cell lines and melanocyte controls are found with differential gene analysis. These fold changes will be next used to test if the integration of the data was successful. 
+
+```{r Differential Gene Expression, eval = FALSE, include = FALSE}
+library(limma)
+#List to store results between all contrasts
+cst.results <- list()
+
+
+#First we need to find out if the immortalized 
+# melanocytes can be used as controls.
+
+# Preparing design and contrast for limma
+dfactor <- factor(pheno.df[[3]]$Status)
+design.matrix <- model.matrix(~0+dfactor)
+colnames(design.matrix) <- levels(dfactor)
+
+#Making the contrasts
+cst.vector <- c( "Immortalized-Control", 
+                 "Melanoma-Control", 
+                 "Melanoma-Immortalized",
+                 "Melanoma-((Immortalized+Control)/2)")
+cst.matrix <- makeContrasts(contrasts = cst.vector, levels = design.matrix)
+
+# Fitting the linear model
+fit <- lmFit( object = exp.matrix[[3]][,-1]
+              , design = design.matrix)
+fit <- contrasts.fit( fit, 
+                      cst.matrix)
+fit <- eBayes( fit ) ; rm( design.matrix, cst.matrix, dfactor)
+for(i in 1:length(cst.vector)){
+  cst.results[[i]] <- topTable( fit , coef = i , adjust.method = "BH", 
+                           genelist = exp.matrix[[3]]$SYMBOL, 
+                           n = Inf, sort.by = "P")
+  names(cst.results)[i] <- paste(experiment[3], cst.vector[i])
+}
+
+# Second dataset with controls is the 4th
+dfactor <- factor(pheno.df[[4]]$Status)
+design.matrix <- model.matrix(~0+dfactor)
+colnames(design.matrix) <- levels(dfactor)
+
+#Making the contrasts
+cst.vector <- "Melanoma-Control"
+cst.matrix <- makeContrasts(contrasts = cst.vector, levels = design.matrix)
+
+# Fitting the linear model
+fit <- lmFit( object = exp.matrix[[4]][,-1]
+              , design = design.matrix)
+fit <- contrasts.fit( fit, 
+                      cst.matrix)
+fit <- eBayes( fit ) ; rm( design.matrix, cst.matrix, dfactor)
+cst.results[[5]] <- topTable( fit , coef = 1 , adjust.method = "BH", 
+                           genelist = exp.matrix[[4]]$SYMBOL, 
+                           n = Inf, sort.by = "P")
+names(cst.results)[5] <- paste(experiment[4], cst.vector[1]) 
+
+#Getting rid of the clutter
+rm(fit, cst.vector, cst.matrix, design.matrix, dfactor)
+
+#Linear models done, differential expression analysis done
+
+#saveRDS(cst.results, file = "deg.rds")
+# The results of this chunk, list "cst.results" is saved as "deg.rds"
+```
+
+##Principal Comoponents Analysis
+
+Principal Components Analysis (PCA) must be conducted to see the general topology of the samples across all experiments. PCA will help validate the result of the integration.
+
+```{r Making global datasets, eval = FALSE, include = FALSE}
+# Renaming samples so to much the sample names in the pheno.df dataset
+colnames(exp.matrix[[1]])[-1] <- pheno.df[[1]]$geo_accession
+pheno.df[[2]]$geo_accession <- colnames(exp.matrix[[2]])[-1]
+colnames(exp.matrix[[3]])[-1] <- pheno.df[[3]]$geo_accession
+colnames(exp.matrix[[4]])[-1] <- pheno.df[[4]]$geo_accession
+
+#Global sets
+pheno.global <- rbind(pheno.df[[1]], pheno.df[[2]],
+                      pheno.df[[3]], pheno.df[[4]])
+pheno.global <- pheno.global %>% 
+  mutate( Status = gsub("Melanocyte control", "Control", Status))
+
+#Make global expression matrix.
+# Need to filter genes, then bind everything. 
+# Uses dplyr's spread
+tmp <- inner_join( dplyr::select(exp.matrix[[1]], SYMBOL),
+                            dplyr::select(exp.matrix[[2]], Symbol),
+                            by = c("SYMBOL" = "Symbol"))
+tmp <- inner_join( tmp, dplyr::select(exp.matrix[[3]], SYMBOL))                         
+genes.global <- inner_join( tmp, dplyr::select(exp.matrix[[4]], SYMBOL))$SYMBOL
+rm(tmp)  
+
+global.exp <- inner_join(exp.matrix[[1]], exp.matrix[[2]], by = c("SYMBOL"="Symbol")) %>% 
+  inner_join(exp.matrix[[3]], by = "SYMBOL") %>% 
+  inner_join(exp.matrix[[4]], by = "SYMBOL" )
+
+#saveRDS(exp.matrix, "expressionMatrices.rds")
+#saveRDS(exp.set, "expSets.rds")
+saveRDS(global.exp, file.path(data.dir,"global_expression_matrix.rds"))
+saveRDS(pheno.global, file.path(data.dir,"global_phenotype.rds"))
+
+```
+
+
+```{r PCA, fig.height= 10 }
+#Loading the data we need
+global.exp <- readRDS(file.path(data.dir,"global_expression_matrix.rds"))
+pheno.global <- readRDS(file.path(data.dir,"global_phenotype.rds"))
+
+
+#Density plots 
+library(gridExtra)
+density.plot <- list()
+# First building the dataset that includes all expressions and labels them
+# according to dataset
+
+global.gather <- global.exp %>% 
+  gather(Sample, Expression, -1) %>% 
+  left_join( pheno.global, by = c("Sample"="geo_accession"))
+
+#Making the plot objects with ggplot
+density.plot[[1]] <- ggplot( data = global.gather, 
+                             aes(Expression, fill = Experiment)) +
+  geom_density(alpha = 0.3)+
+  viridis::scale_fill_viridis(discrete = TRUE, option = "magma")
+
+density.plot[[2]] <-  ggplot( data = global.gather, 
+                             aes(Expression, fill = Status)) +
+  geom_density(alpha = 0.3)+
+  viridis::scale_fill_viridis(discrete = TRUE, option = "magma") 
+
+density.plot[[3]] <-  ggplot( data = global.gather, 
+                             aes(Expression, fill = Platform)) +
+  geom_density(alpha = 0.3)+
+  viridis::scale_fill_viridis(discrete = TRUE, option = "magma") 
+
+do.call( "grid.arrange", c(density.plot, nrow = 3) )
+
+
+
+#PCA to see if we have differences between datasets
+df.to.pca <- t(global.exp[,-1])
+pca <- prcomp( df.to.pca )
+pca.variance <- (pca$sdev)^2 / sum(pca$sdev^2)
+
+rm(df.to.pca)
+#Visualizing with plots
+pca.plot <- list()
+
+#Checking for clustering by Experiment
+df.pca <- as.data.frame(pca$x)
+df.pca[,c("Status", "Experiment", "Platform")] <- pheno.global[,c("Status", 
+                                                                  "Experiment",
+                                                                  "Platform")]
+#Plotting by Status
+pca.plot[[1]] <- ggplot(data = df.pca, aes(x = PC1,y = PC2, color = Status)) +
+  geom_point() +
+  labs( x = paste( "PC1 (", round(100*pca.variance[1], 2), "%)"),
+        y = paste( "PC2 (", round(100*pca.variance[2], 2), "%)")) +
+  viridis::scale_color_viridis(alpha = 0.7, discrete = TRUE, direction = -1)
+
+#Plotting by Experiment
+pca.plot[[2]] <- ggplot(data = df.pca, aes(x = PC1,y = PC2, 
+                                           color = Experiment,
+                                           shape = Status)) +
+  geom_point() +
+  labs( x = paste( "PC1 (", round(100*pca.variance[1], 2), "%)"),
+        y = paste( "PC2 (", round(100*pca.variance[2], 2), "%)")) +
+  viridis::scale_color_viridis( discrete = TRUE, direction = -1)
+
+#Plotting by Platform
+pca.plot[[3]] <- ggplot(data = df.pca, aes(x = PC1,y = PC2, 
+                                           color = Experiment, 
+                                           shape = Platform)) +
+  geom_point() +
+  labs( x = paste( "PC1 (", round(100*pca.variance[1], 2), "%)"),
+        y = paste( "PC2 (", round(100*pca.variance[2], 2), "%)")) +
+  viridis::scale_color_viridis( discrete = TRUE, direction = -1) 
+
+do.call("grid.arrange",c(pca.plot, nrow = 3))
+
+```
+
+It is obvious that the four experiments are heavily dependent on the platform across whicheach experiment was done. Thus the batch for the batch effect removal and the integration of the experiments will be the platform. Batch effect removal is conducted through the use of *ComBat* function in the **sva** package.
+
+```{r Data integration, fig.height= 12 }
+library(sva)
+
+#Model matrix
+mod <- model.matrix(~0+ factor(Status), data = pheno.global)
+colnames(mod) <- names(table(pheno.global$Status))
+
+#Model matrix for comBat
+modcombat <- model.matrix(~1, data = pheno.global)
+
+
+combat.exp <- ComBat(dat = as.matrix(global.exp[,-1]),
+                     batch = factor(pheno.global$Platform),
+                     mod = modcombat, par.prior = TRUE, 
+                     prior.plots = FALSE)
+
+#Getting the corrected dataset
+global.exp.corrected <- cbind(dplyr::select(global.exp, SYMBOL), 
+                              as.data.frame(combat.exp))
+
+
+#PCA with the corrected matrix to validate
+df.to.pca.corrected <- t(global.exp.corrected[,-1])
+pca.corrected <- prcomp( df.to.pca.corrected )
+pca.variance.corrected <- (pca.corrected$sdev)^2 / sum(pca.corrected$sdev^2)
+
+#Visualizing with plots
+pca.corrected.plot <- list()
+
+#Checking for clustering by Experiment
+df.pca.corrected <- as.data.frame(pca.corrected$x)
+df.pca.corrected[,c("Status", "Experiment", "Platform")] <- pheno.global[,c("Status", 
+                                                                  "Experiment",
+                                                                  "Platform")]
+#Plotting by Status
+pca.corrected.plot[[1]] <- ggplot(data = df.pca.corrected, aes(x = PC1,y = PC2, 
+                                                               color = Status)) +
+  geom_point() +
+  labs( x = paste( "PC1 (", round(100*pca.variance.corrected[1], 2), "%)"),
+        y = paste( "PC2 (", round(100*pca.variance.corrected[2], 2), "%)")) +
+  viridis::scale_color_viridis(alpha = 0.7, discrete = TRUE, direction = -1)
+
+#Plotting by Experiment
+pca.corrected.plot[[2]] <- ggplot(data = df.pca.corrected, aes(x = PC1,y = PC2, 
+                                           color = Experiment,
+                                           shape = Status)) +
+  geom_point() +
+  labs( x = paste( "PC1 (", round(100*pca.variance.corrected[1], 2), "%)"),
+        y = paste( "PC2 (", round(100*pca.variance.corrected[2], 2), "%)")) +
+  viridis::scale_color_viridis( discrete = TRUE, direction = -1)
+
+#Plotting by Platform
+pca.corrected.plot[[3]] <- ggplot(data = df.pca.corrected, aes(x = PC1,y = PC2, 
+                                           color = Experiment, 
+                                           shape = Platform)) +
+  geom_point() +
+  labs( x = paste( "PC1 (", round(100*pca.variance.corrected[1], 2), "%)"),
+        y = paste( "PC2 (", round(100*pca.variance.corrected[2], 2), "%)")) +
+  viridis::scale_color_viridis( discrete = TRUE, direction = -1) 
+
+do.call("grid.arrange",c(pca.corrected.plot, nrow = 3))
+
+```
+
+The data integration through ComBat seems to have nice results. A more thorough cehck is performed by checking the changes of the logFC in the experiments, before and after the integration.
+
+```{r Data Integration Results, fig.height = 8}
+#To check the success rate of the integration we will find the before and after
+# FC of our data. We will use the preprocessed data global.exp, the corrected
+# global.exp.corrected, and the pheno.global to define factors and contrasts.
+library(limma)
+#GSE22301-----------------------------------------
+index <- which(pheno.global$Experiment == experiment[3])
+dfactor <- factor( pheno.global$Status[index])
+
+design.matrix <- model.matrix(~0+dfactor)
+colnames(design.matrix) <- levels(dfactor)
+
+#Making the contrasts
+cst.vector <- c( "Immortalized-Control", 
+                 "Melanoma-Control", 
+                 "Melanoma-Immortalized",
+                 "Melanoma-((Immortalized+Control)/2)")
+cst.matrix <- makeContrasts(contrasts = cst.vector, levels = design.matrix)
+
+# Fitting the linear model
+limma_results <- list()
+fit <- lmFit( object = (global.exp[,-1])[,index]
+              , design = design.matrix)
+fit <- contrasts.fit( fit, 
+                      cst.matrix)
+fit <- eBayes( fit ) ; rm( design.matrix, cst.matrix, dfactor)
+for(i in 1:length(cst.vector)){
+  limma_results[[i]] <- topTable( fit , coef = i , adjust.method = "BH", 
+                           genelist = global.exp$SYMBOL, 
+                           n = Inf, sort.by = "P")
+  names(limma_results)[i] <- paste(experiment[3], cst.vector[i], "Preprocessed")
+}
+
+#GSE35388-----------------------------------------
+index <- which(pheno.global$Experiment == experiment[4])
+dfactor <- factor( pheno.global$Status[index])
+
+design.matrix <- model.matrix(~0+dfactor)
+colnames(design.matrix) <- levels(dfactor)
+
+#Making the contrasts
+cst.vector <- c( "Melanoma-Control")
+cst.matrix <- makeContrasts(contrasts = cst.vector, levels = design.matrix)
+
+# Fitting the linear model
+fit <- lmFit( object = (global.exp[,-1])[,index]
+              , design = design.matrix)
+fit <- contrasts.fit( fit, 
+                      cst.matrix)
+fit <- eBayes( fit ) ; rm( design.matrix, cst.matrix, dfactor)
+
+limma_results[[5]] <- topTable( fit , coef = 1 , adjust.method = "BH", 
+                           genelist = global.exp$SYMBOL, 
+                           n = Inf, sort.by = "P")
+names(limma_results)[5] <- paste(experiment[4], cst.vector[1], "Preprocessed")
+
+
+#GSE22301 corected-----------------------------------------
+index <- which(pheno.global$Experiment == experiment[3])
+dfactor <- factor( pheno.global$Status[index])
+
+design.matrix <- model.matrix(~0+dfactor)
+colnames(design.matrix) <- levels(dfactor)
+
+#Making the contrasts
+cst.vector <- c( "Immortalized-Control", 
+                 "Melanoma-Control", 
+                 "Melanoma-Immortalized",
+                 "Melanoma-((Immortalized+Control)/2)")
+cst.matrix <- makeContrasts(contrasts = cst.vector, levels = design.matrix)
+
+# Fitting the linear model
+fit <- lmFit( object = (global.exp.corrected[,-1])[,index]
+              , design = design.matrix)
+fit <- contrasts.fit( fit, 
+                      cst.matrix)
+fit <- eBayes( fit ) ; rm( design.matrix, cst.matrix, dfactor)
+i.init <- length(limma_results)
+for(i in (i.init+1):(i.init+length(cst.vector))){
+  limma_results[[i]] <- topTable( fit , coef = i-i.init , adjust.method = "BH", 
+                           genelist = global.exp$SYMBOL, 
+                           n = Inf, sort.by = "P")
+  names(limma_results)[i] <- paste(experiment[3], cst.vector[i-i.init],
+                                   "Corrected")
+}
+
+#GSE35388 corrected-----------------------------------------
+index <- which(pheno.global$Experiment == experiment[4])
+dfactor <- factor( pheno.global$Status[index])
+
+design.matrix <- model.matrix(~0+dfactor)
+colnames(design.matrix) <- levels(dfactor)
+
+#Making the contrasts
+cst.vector <- c( "Melanoma-Control")
+cst.matrix <- makeContrasts(contrasts = cst.vector, levels = design.matrix)
+
+# Fitting the linear model
+fit <- lmFit( object = (global.exp.corrected[,-1])[,index]
+              , design = design.matrix)
+fit <- contrasts.fit( fit, 
+                      cst.matrix)
+fit <- eBayes( fit ) ; rm( design.matrix, cst.matrix, dfactor)
+
+i.init <- length(limma_results)
+for(i in (i.init+1):(i.init+length(cst.vector))){
+  limma_results[[i]] <- topTable( fit , coef = i-i.init , adjust.method = "BH", 
+                           genelist = global.exp$SYMBOL, 
+                           n = Inf, sort.by = "P")
+  names(limma_results)[i] <- paste(experiment[4], cst.vector[i-i.init],
+                                   "Corrected")
+}
+
+
+```
+
+```{r Data integration resuts visualized, fig.height=8}
+integration.plot <- list()
+
+for(i in 1:as.integer(length(limma_results)/2)){
+tmp <- limma_results[[i]] %>% 
+  dplyr::select(ID, logFC, adj.P.Val) %>% 
+  dplyr::rename(pre.logFC = logFC, pre.adj.P.Val = adj.P.Val)
+  
+tmp2 <- limma_results[[i+as.integer(length(limma_results)/2)]] %>% 
+  dplyr::select(ID, logFC, adj.P.Val) %>% 
+  dplyr::rename(after.logFC = logFC, after.adj.P.Val = adj.P.Val)
+
+tmpdf <- inner_join(tmp, tmp2, by = "ID")
+
+integration.plot[[i]] <- ggplot(data = tmpdf, aes(x = pre.logFC, y=after.logFC))+
+  geom_point()+
+  geom_smooth(method = "gam")+
+  labs( title = gsub(" Prep.*| Corr.*", "", names(limma_results)[i]),
+        subtitle = paste("Correlation", 
+                         format(cor(tmpdf$pre.logFC, tmpdf$after.logFC), 
+                                digits = 2)))+
+  geom_abline(slope = 1, intercept = 0)
+} ;rm(tmp, tmp2, tmpdf)
+
+do.call("grid.arrange", c(integration.plot, nrow = 2))
+
+rm(mod, modcombat, fit, df.pca, pca, pca.corrected, cst.vector, i, i.init, index)
+
+```
+
+
+```{r Getting creative with integration}
+#Getting creative
+# Playing with the integrated dataset to search for hidden gems.
+eda.plots <- list()
+# FUNction to make limma easier
+limma.top.table <- function( name, dfactor, expression, contrast.vector){
+  design.matrix = model.matrix(~0+dfactor)
+  colnames(design.matrix) <- levels(dfactor)
+  
+  #making contrasts
+  contrast.matrix = makeContrasts(contrasts = contrast.vector, 
+                             levels = design.matrix)
+  fit = lmFit( object = expression[,-1], 
+                design = design.matrix)
+  fit = contrasts.fit( fit, 
+                      contrast.matrix)
+  fit = eBayes( fit ) 
+  
+  limma.top.list =lapply(c(1:length(contrast.vector)), 
+                         FUN =  topTable, 
+                         fit = fit, 
+                         genelist = expression$SYMBOL, 
+                         number = Inf, adjust.method = "BH",sort.by = "p")
+  names(limma.top.list)  = paste(name, contrast.vector)
+  return(limma.top.list)
+}
+
+
+#Function to visualize things easier
+compare.ggplot <- function(toptable1, toptable2, type = "FC") {
+  tmp1 = toptable1 %>% 
+    dplyr::select( ID, first.logFC = logFC, first.P.val = adj.P.Val) %>% 
+    mutate( first.P.val = -log10(first.P.val))
+  tmp2 = toptable2 %>% 
+    dplyr::select( ID, second.logFC = logFC, second.P.val = adj.P.Val) %>% 
+    mutate( second.P.val = -log10(second.P.val))
+  tmpdf = inner_join(tmp1, tmp2, by = "ID")
+  if(type == "FC"){
+    ggobject = ggplot( data = tmpdf, aes(first.logFC, second.logFC)) +
+    geom_point(alpha = 0.6)+
+    geom_smooth(method = "gam")+
+    geom_abline(slope = 1, intercept = 0)+
+    labs(subtitle = paste("Correlation of logFC", 
+                          format( cor(tmpdf$first.logFC, tmpdf$second.logFC),
+                                  digits = 2)),
+         x = "First FC",
+         y = "Second FC")
+  return(ggobject)
+  }
+  if(type %in% c("p", "P")){
+    ggobject = ggplot( data = tmpdf, aes(first.P.val, 
+                                         second.P.val)) +
+    geom_point(alpha = 0.7)+
+    geom_smooth(method = "gam")+
+    geom_abline(slope = 1, intercept = 0)+
+    labs(subtitle = paste("Correlation of logFC", 
+                          format( cor(tmpdf$first.logFC, tmpdf$second.logFC),
+                                  digits = 2)),
+         x = "First FC",
+         y = "Second FC")
+    return(ggobject)
+  }
+}
+
+
+# Trying to include all controls in the experiments, together with immortalized
+# melanocytes
+#First for GSE22301
+index <- which(pheno.global$Experiment == experiment[3] |
+                 pheno.global$Status %in% c("Control", "Immortalized"))
+
+dfactor <- pheno.global[index,]$Status %>% 
+  gsub(pattern = "Control|Immortalized", replacement = "Control", x = .) %>% 
+  factor(.)
+
+#Making the contrasts
+contrast.vector <- c( "Melanoma-Control")
+#Top table
+tmp <- limma.top.table(name = "GSE22301 with all ctrls+immort",
+                       dfactor = dfactor, 
+                       expression = global.exp[,c(1,index+1)],
+                       contrast.vector = contrast.vector)
+
+eda.plots[[1]] <- compare.ggplot(
+  toptable1 = limma_results$`GSE22301 Melanoma-Control Corrected`,
+  toptable2 = tmp[[1]]) +
+  labs( title = "Melanoma-Control",
+        x = "logFC samples of GSE22301", 
+        y = "logFC melanomas of GSE22301 & global m/cytes",
+        caption = "Using melanoma samples from GSE22301 and controls from all
+        experiments together with immortalized melanocytes")  +
+  theme(plot.caption = element_text(hjust = -0.1)) 
+
+#Now excluding immortalized to see the difference
+index <- c(which(pheno.global$Experiment == experiment[3] & 
+                 pheno.global$Status != "Immortalized"),
+           which(pheno.global$Experiment == experiment[4] &
+                   pheno.global$Status == "Control"))
+
+dfactor <- pheno.global[index,]$Status %>%  factor(.)
+
+#Making the contrasts
+contrast.vector <- c( "Melanoma-Control")
+#Top table
+tmp <- limma.top.table(name = "GSE22301 with all controls",
+                       dfactor = dfactor, 
+                       expression = global.exp.corrected[,c(1,index+1)],
+                       contrast.vector = contrast.vector)
+
+eda.plots[[2]] <- compare.ggplot(
+  toptable1 = limma_results$`GSE22301 Melanoma-Control Corrected`,
+  toptable2 = tmp[[1]]) +
+  labs( title = "Melanoma-Control",
+        x = "logFC from samples of GSE22301", 
+        y = "logFC from melanomas of GSE22301 and global m/cytes",
+        caption = "Using melanoma samples from GSE22301 and controls from all
+        experiments together but NO immortalized melanocytes")  +
+  theme(plot.caption = element_text(hjust = -0.1))
+
+do.call("grid.arrange", c(eda.plots[1:2], ncol = 2)) 
+
+
+# Melanoma - Control all samples vs GSE35388
+index <- c(which(pheno.global$Experiment == experiment[4] | 
+                 pheno.global$Status == "Control"))
+
+dfactor <- pheno.global[index,]$Status %>%  factor(.)
+
+#Making the contrasts
+contrast.vector <- c( "Melanoma-Control")
+#Top table
+tmp <- limma.top.table(name = "GSE35388 with all controls",
+                       dfactor = dfactor, 
+                       expression = global.exp.corrected[,c(1,index+1)],
+                       contrast.vector = contrast.vector)
+
+eda.plots[[3]] <- compare.ggplot(
+    toptable1 = limma_results$`GSE35388 Melanoma-Control Corrected`,
+  toptable2 = tmp[[1]]) +
+  labs( title = "Melanoma-Control",
+        x = "logFC from samples of GSE35388", 
+        y = "logFC from melanomas of GSE35388 and global m/cytes",
+        caption = "Using melanoma samples from GSE35388 and controls from all
+        experiments together but NO immortalized melanocytes")  +
+  theme(plot.caption = element_text(hjust = -0.1))
+
+eda.plots[[3]]
+
+#PCA space clusters and similarities/outliers--------
+df.pca.corrected <- as.data.frame(pca.corrected$x) %>% 
+  cbind( pheno.global )
+
+eda.plots[[4]] <- ggplot(data = df.pca.corrected, 
+                         aes(x = PC1, y = PC2, color = Experiment, 
+                             shape = Status, label = title)) +
+  geom_point( alpha = 0.7, size = 2) + 
+  ggrepel::geom_label_repel( 
+    data = subset(df.pca.corrected, 
+                  Status == "Control" | Status == "Immortalized"|
+                    grepl(".*375",title) | (PC1 < -20 & PC2 < 0)),
+    show.legend = FALSE, size = 3,min.segment.length = 0)+
+  labs( x = paste("PC1 (", format(pca.variance.corrected[1], digits = 2), "%)"),
+        y = paste("PC2 (", format(pca.variance.corrected[2], digits = 2), "%)"),
+        title = "PCA space",
+        subtitle = "Looking for similarities between cell lines",
+        caption = "Melanocytes, outliers of the melanoma cell lines and 
+        important cell line A-375 are labeled") +
+#    scale_shape_manual(values = c(15:18)) +
+    scale_color_brewer(type = "qual", palette = "Dark2")
+  
+eda.plots[[4]]
+
+#Clustering in the PCA space
+clusters <- hclust( dist( pca.corrected$x[,1:2]),method = "complete")
+clusterCut <- cutree(clusters, 7)
+
+#plot(clusters)
+#table(clusterCut, df.pca.corrected$Status)
+
+df.pca.corrected <- as.data.frame(pca.corrected$x) %>% 
+  cbind( pheno.global ) %>% 
+  cbind(data.frame(Cluster = as.character(clusterCut)))
+                           
+#finding the convex hull of the points
+convex_hull <- function(df) df[chull(df$PC1, df$PC2), ]
+hulls <- df.pca.corrected %>% 
+  group_by( Cluster ) %>% do( convex_hull(.) ) %>% as.data.frame(.)
+
+eda.plots[[5]] <- ggplot( data = df.pca.corrected, 
+        aes(PC1, PC2, shape = Status, color = Cluster, fill = Cluster)) +
+  geom_point(alpha = 1) +
+  geom_point(show.legend = FALSE, size = 3,
+             data = subset(df.pca.corrected, 
+                           Status %in% c("Control", "Immortalized"))) +
+  geom_polygon(data = hulls, aes(PC1, PC2, color = Cluster, fill = Cluster ), 
+               alpha = 0.1, show.legend = FALSE, inherit.aes = FALSE) +
+  scale_color_brewer(type = "qual", palette = "Dark2" ) + 
+  labs( title = "Clusters of cell lines in the PCA space", 
+        x = paste("PC1 (", format(100*pca.variance.corrected[1], digits=2), "%)"),
+        y = paste("PC2 (", format(100*pca.variance.corrected[2], digits=2), "%)"),
+        subtitle = "Cluster anglomeration method = 'Complete'",
+        caption = "Controls cluster together, immortalized melanocytes are 
+        close but cluster with melanoma cell lines") + 
+  theme(plot.caption = element_text(hjust = -0.1))
+  
+eda.plots[[5]]
+#Wrapper Function for the above if we only want the plot
+
+make.cluster.plot <- function(pca, pheno, n, clustmethod = "complete") {
+  
+  clusters = hclust( dist( pca$x[,1:2]), method = clustmethod)
+  clusterCut = cutree(clusters, n)
+  
+  df = as.data.frame(pca$x) %>% 
+    cbind( pheno ) %>% 
+    cbind(data.frame(Cluster = as.character(clusterCut)))
+                             
+  #finding the convex hull of the points
+  convex_hull = function(df) df[chull(df$PC1, df$PC2), ]
+  hulls = df %>% 
+    group_by( Cluster ) %>% do( convex_hull(.) ) %>% as.data.frame(.)
+  
+  grobject = ggplot( data = df, 
+          aes(PC1, PC2, shape = Status, color = Cluster, fill = Cluster)) +
+    geom_point(alpha = 1) +
+    geom_point(show.legend = FALSE, size = 3,
+               data = subset(df, 
+                             Status %in% c("Control", "Immortalized"))) +
+    geom_polygon(data = hulls, aes(PC1, PC2, color = Cluster, fill = Cluster ), 
+                 alpha = 0.1, show.legend = FALSE, inherit.aes = FALSE) +
+    scale_color_brewer(type = "qual", palette = "Dark2" ) + 
+    labs( title = "Clusters of cell lines in the PCA space", 
+          x = paste("PC1 (", format(
+            summary(pca)$importance[2,1], digits=2), "%)"),
+          y = paste("PC2 (", format(
+            summary(pca)$importance[2,2], digits=2), "%)"),
+          subtitle = paste("Cluster anglomeration method =", clustmethod),
+          caption = "NA") + 
+    theme(plot.caption = element_text(hjust = -0.1))
+  return(grobject)
+}
+
+# cluster.plots <- lapply( c(3:6), 
+#                          FUN = make.cluster.plot, 
+#                          pca = pca.corrected, pheno = pheno.global,
+#                          clustmethod = "complete")
+# do.call("grid.arrange", c(cluster.plots, ncol = 2))
+# 
+# cluster.plots <- lapply( c(7:8),
+#                          FUN = make.cluster.plot, 
+#                          pca = pca.corrected, pheno = pheno.global,
+#                          clustmethod = "complete")
+# do.call("grid.arrange", c(cluster.plots, ncol = 2))
+# 
+# cluster.plots <- lapply( c(3:6), 
+#                          FUN = make.cluster.plot, 
+#                          pca = pca.corrected, pheno = pheno.global,
+#                          clustmethod = "average")
+# do.call("grid.arrange", c(cluster.plots, ncol = 2))
+# 
+# cluster.plots <- lapply( c(7:8),
+#                          FUN = make.cluster.plot, 
+#                          pca = pca.corrected, pheno = pheno.global,
+#                          clustmethod = "average")
+# do.call("grid.arrange", c(cluster.plots, ncol = 2))
+
+```
+
+```{r saving important results}
+saveRDS(pheno.global,file.path(results.dir,"pheno_global.rds"))
+saveRDS(global.exp.corrected,file.path(results.dir,"global_exp_corrected.rds") )
+saveRDS(df.pca.corrected,file.path(results.dir,"df_pca_corrected.rds") )
+
+```

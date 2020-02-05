@@ -1,0 +1,445 @@
+---
+title: "Lab Report"
+author: "Kostas Ntagiantas"
+date: "July 20, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = TRUE, echo = FALSE, results = "hide", warning = 
+                        FALSE, message = FALSE, cache.lazy = FALSE, fig.align = 
+                        "center" , cache = FALSE)
+library(knitr)
+library(tidyverse)
+
+code.name <- "Labreport" 
+data.dir <- file.path(getwd(), "data", code.name)
+results.dir <- file.path(getwd(), "results", code.name)
+experiment <- c("GSE7127", "GSE36133", "GSE22301", "GSE35388")
+
+
+labcells <- c("A-375", "A375", "IGR-37"  ,"Malme-3M","MEL-JUSO","MeWo", "SKMEL13", "SKMEL147", "SKMEL19", "SK-MEL-2", "SKMEL28", "SK-MEL-5", "WM-115", "WM35", "WM1552c", "WM-793")
+load(file.path(data.dir, "Input.RData"))
+
+
+```
+
+#Datasets
+
+The panel shown below contains 144 melanoma cell lines and 6 normal melanoyctes (2 immortal included) from 4 different experiments querried from GEO. Raw data processed with the RMA algorithm, integrated with ComBat, removing the batch effect caused from the three different platforms.
+
+```{r Dataset presentation}
+df.to.pca.corrected <- t(global.exp.corrected[,-1])
+pca.corrected <- prcomp( df.to.pca.corrected )
+pca.variance.corrected <- (pca.corrected$sdev)^2 / sum(pca.corrected$sdev^2)
+rm(df.to.pca.corrected, pca.corrected)
+
+plots.pca <- list()
+#Plotting by Status
+plots.pca[[1]] <- ggplot(data = df.pca.corrected, aes(x = PC1,y = PC2, color = Status)) +
+  geom_point() +
+  labs( x = paste( "PC1 (", round(100*pca.variance.corrected[1], 2), "%)"),
+        y = paste( "PC2 (", round(100*pca.variance.corrected[2], 2), "%)"),
+        title = "First two principal components") +
+  viridis::scale_color_viridis(alpha = 0.7, discrete = TRUE, direction = -1)
+
+#Plotting by Experiment
+plots.pca[[2]] <- ggplot(data = df.pca.corrected, aes(x = PC1,y = PC2, 
+                                    color = Experiment, shape = Status)) +
+  geom_point() +
+  labs( x = paste( "PC1 (", round(100*pca.variance.corrected[1], 2), "%)"),
+        y = paste( "PC2 (", round(100*pca.variance.corrected[2], 2), "%)")) +
+  viridis::scale_color_viridis( discrete = TRUE, direction = -1)
+
+#Plotting by Platform
+plots.pca[[3]] <- ggplot(data = df.pca.corrected, aes(x = PC1,y = PC2,
+                                    color = Experiment, shape = Platform)) +
+  geom_point() +
+  labs( x = paste( "PC1 (", round(100*pca.variance.corrected[1], 2), "%)"),
+        y = paste( "PC2 (", round(100*pca.variance.corrected[2], 2), "%)")) +
+  viridis::scale_color_viridis( discrete = TRUE, direction = -1) 
+
+do.call(gridExtra::grid.arrange,c(plots.pca[2:3], ncol = 2))
+
+#Including clusters
+convex_hull <- function(df) df[chull(df$PC1, df$PC2), ]
+hulls <- df.pca.corrected %>% 
+  group_by( Cluster ) %>% do( convex_hull(.) ) %>% as.data.frame(.)
+
+
+#Visualizing important cell lines
+ggplot(data = df.pca.corrected, 
+                         aes(x = PC1, y = PC2, 
+                             shape = Status, color = Cluster,
+                             label = title)) +
+  geom_point( alpha = 0.7, size = 2) + 
+  geom_polygon(data = hulls, aes(PC1, PC2, color = Cluster, fill = Cluster ), 
+               alpha = 0.1, show.legend = FALSE, inherit.aes = FALSE) +
+  ggrepel::geom_label_repel( 
+    data = subset(df.pca.corrected, 
+                  Status == "Control" | Status == "Immortalized"|
+                    title %in% labcells),
+    show.legend = FALSE, size = 3,min.segment.length = 0, inherit.aes = FALSE,
+    aes(x = PC1, y = PC2, fill = Experiment,label = title))+
+  labs( x = paste("PC1 (", format(100*pca.variance.corrected[1], digits = 2), "%)"),
+        y = paste("PC2 (", format(100*pca.variance.corrected[2], digits = 2), "%)"),
+        title = "Lab cell lines & Healthy cells",
+        subtitle = "Looking for similarities between cell lines") +
+#    scale_shape_manual(values = c(15:18)) +
+    scale_color_brewer(type = "qual", palette = "Dark2")+
+  viridis::scale_fill_viridis(discrete = TRUE)
+
+```
+
+As seen in the plot above, the cell lines that are available in the lab span across most of the space defined by the two main principal components. As a validation of the successful data integration, the healthy controls are close together and close to the immortalized melanocytes, while the four different biological samples of cell lines A-375 are also close together, despite coming from different experiments and platforms.
+
+By the way the cell lines cluster in the PCA space, 7 clusters are defined. It is assumed, that each cluster has biological differences from the others. For this reason, the iterative procedure by which the Differentially Expressed Genes are found is applied in each cluster separately. 
+The cell lines that interest us do not include any in cluster 6 that anyway seems to be an outlier and comes from the HS- family of cell lines (Hs-600T, Hs-688(A)T, Hs-834T, Hs-839T, etc.)
+
+##Lab cell lines in the PCA space of the 144 melanoma cell lines
+
+```{r Lab cell lines in their cluster, results = 'markup'}
+library(kableExtra)
+
+tmp <- df.pca.corrected %>% filter(title %in% labcells) %>% 
+  dplyr::select(`Cell line` = title, Cluster) %>% arrange(by = Cluster) %>% dplyr::select(2,1)
+
+# write.csv( (df.pca.corrected %>% filter(title %in% labcells) %>% 
+#   dplyr::select(title, Cluster) %>% arrange(by = Cluster)),
+#   file = file.path(data.dir,"lines.csv"), quote = FALSE, row.names = FALSE) 
+
+tmp %>%
+  mutate(Cluster = cell_spec(Cluster, color = "white", 
+                             background = factor(Cluster, c(1:5), 
+                                                 c("#0000FF", "#98F5FF", "#000000", 
+                                                   "#FF8C00", "#8B0000")))) %>% 
+    kable(escape = FALSE) %>% kable_styling("striped", full_width = FALSE) %>% 
+  scroll_box(width = "400px", height = "300px")
+```
+
+
+#Differentially expressed genes
+
+```{r DEGs presentation, results = 'markup'}
+
+present.degs <- function(cluster) {
+
+  gene.index <- genes.mel.healthy %>% filter(Set == cluster) %>% 
+    group_by(Gene) %>% 
+    summarise(n = n() )  %>%
+    filter(n > 800) %>% .$Gene
+ 
+  df = genes.mel.healthy %>% filter(Set == cluster & Gene %in% gene.index)
+  
+  check.fc.sign = df %>% 
+    dplyr::select(1,2) %>% group_by(Gene) %>% 
+    summarise( Check = (length(table(logFC > 0)) == 1)) %>% .$Check %>% table(.) %>% length(.)
+  if( check.fc.sign != 1 ) stop("logFC not of the same sign across iterations")
+  
+  df = df %>% group_by(Gene) %>% summarise( meanLogFC = mean(logFC))
+  up = df %>% filter(meanLogFC > 0) %>% arrange(by = desc(meanLogFC)) %>% mutate(Direction = "up")
+  down = df %>% filter(meanLogFC < 0) %>% arrange(by = (meanLogFC)) %>% mutate(Direction = "down")
+  
+  return(bind_rows(up,down))
+  
+}
+deg.list <- lapply(unique(genes.mel.healthy$Set)[-7], present.degs)
+
+deg.df <- map2_df(.x = deg.list, .y = unique(genes.mel.healthy$Set)[-7],
+                    ~mutate(.x, Set = .y)) ;rm(deg.list)
+
+deg.df %>%
+   mutate(Direction = cell_spec(Direction, color = "white", 
+                              background = factor(Direction, c("up", "down"), 
+                                                  c(rainbow(2)))),
+          Set = cell_spec(Set, color = "white",
+                          background = factor(Set, unique(deg.df$Set),
+                                              c(terrain.colors(6))))) %>% 
+    kable(escape = FALSE) %>% kable_styling("striped", full_width = TRUE) %>% 
+  scroll_box( height = "300px")
+
+```
+
+The differentially expressed genes that are used in the cMap tool to find drugs with similar/oposite signature are found through an iterative process: for every cluster, 6 melanoma samples are randomly selected and then differential gene analysis is conducted against the 6 normal melanocytes. This process is repeated 1000 times and then the genes are selected that are differentially expressed in at least 800 of the 1000 simulations. 
+
+As we are interested only in the cell lines available in the lab, cluster 6 is left out of this analysis as is contains none of these cell lines. 
+
+The results are stored in the table below. You can copy them in the *Query* tool of *cMap* and get results to find compounds.
+
+```{r DEGs specialized, results = 'markup'}
+all.degs <- list()
+
+ #For clusters 1,2,3
+df <- deg.df %>% filter(Set %in% paste("From cluster",c(1,2,3)))
+
+all.degs$Clusters123 <- df %>% group_by(Direction, Gene) %>% 
+  summarise(PresentIn = n()) %>% filter(PresentIn ==3) %>% dplyr::select(1,2) %>% ungroup()
+# write.csv(all.degs$Clusters123, 
+#   file = file.path(data.dir,"cl123.csv"), quote = FALSE, row.names = FALSE) 
+
+all.degs$Clusters123 %>%
+   mutate(Direction = cell_spec(Direction, color = "white", 
+                              background = factor(Direction, c("up", "down"), 
+                                                  c(rainbow(2))))) %>% 
+    kable(escape = FALSE,caption = "Differentially expressed genes in clusters 1-2-3") %>% kable_styling("striped", full_width = TRUE) %>% 
+  scroll_box( height = "300px")
+
+#For clusters 4,5
+df <- deg.df %>% filter(Set %in% paste("From cluster",c(4,5)))
+
+all.degs$Clusters45 <- df %>% group_by(Direction, Gene) %>% 
+  summarise(PresentIn = n()) %>% filter(PresentIn %in% c(1,2)) %>% dplyr::select(1,2) %>% ungroup()
+
+# write.csv(all.degs$Clusters45, 
+#   file = file.path(data.dir,"cl45.csv"), quote = FALSE, row.names = FALSE) 
+
+all.degs$Clusters45 %>%
+   mutate(Direction = cell_spec(Direction, color = "white", 
+                              background = factor(Direction, c("up", "down"), 
+                                                  c(rainbow(2))))) %>% 
+    kable(escape = FALSE,caption = "Differentially expressed genes in clusters 4-5") %>% kable_styling("striped", full_width = TRUE) %>% 
+  scroll_box( height = "300px")
+
+
+```
+
+##Analysis of the lab cells
+
+Focusing on the lab cells, the first step is to build a positive control, to be able to compare downstream with the rest of the lines.The A-375 cell line is selected for the role of the positive control, as there are 4 samples available coming from three different experiments, and also because of the importance and abundancy of the line in many experiments and citations.
+
+```{r Positive control A-375, results = 'markup'} 
+library(limma)
+source(file.path(getwd(), "code", "limma_top_table.R"))
+
+index <- c( grep(pattern = "375",pheno.global$title), grep("Control", pheno.global$Status))
+
+positive.control.degs <- limma.top.table(name = "A-375", 
+                                         dfactor = factor(pheno.global$Status[index]),
+                                         expression = global.exp.corrected[,c(1,index+1)],
+                                         contrast.vector = "Melanoma-Control")[[1]]
+all.degs$A375 <- positive.control.degs %>% 
+  filter(adj.P.Val < 0.01 & abs(logFC)>2) %>% 
+  mutate(Direction = ifelse(logFC>0,"up", "down")) %>% 
+  dplyr::select(Direction, Gene = ID, logFC, adj.P.Val ) %>% 
+  arrange(by = Direction)
+
+
+
+#write.csv(df, file = file.path(data.dir,"A375.csv"), quote = FALSE, row.names = FALSE) 
+
+all.degs$A375  %>% mutate(Direction = cell_spec(Direction, color = "white", 
+                              background = factor(Direction, c("up", "down"), 
+                                                  c(rainbow(2))))) %>% 
+    kable(escape = FALSE,caption = "Differentially expressed genes in A375") %>% 
+  kable_styling("striped", full_width = TRUE) %>% 
+  scroll_box( height = "300px")
+
+
+```
+
+The rest of the lab cell lines along with the positive control are then clustered together to contrast with the healthy samples and find a gene signature for every cluster.
+
+```{r Clustering lab cell lines}
+index <- c( which(pheno.global$title %in% labcells), 
+            which(pheno.global$Histology == "Melanocyte control"))
+
+lab.clusters <- hclust(dist(df.pca.corrected[index,1:2]),method = "complete")
+lab.clusters.cut <- cutree(lab.clusters, 4)
+df <- df.pca.corrected[index,c(1:2,151:158)] %>% 
+  bind_cols(data.frame(LabClusters = factor(lab.clusters.cut)))
+
+lab.hulls <- df %>% 
+  group_by( LabClusters ) %>% do( convex_hull(.) ) %>% as.data.frame(.)
+
+
+ggplot(data = df.pca.corrected,
+       aes(x = PC1, y = PC2, shape = Status,label = title)) +
+  geom_point( alpha = 0.7, size = 2, aes(x = PC1, y = PC2, 
+                             shape = Status)) + 
+  geom_point( data = df, aes(x = PC1, y = PC2, 
+                             color = LabClusters, fill = LabClusters, shape = Status), 
+              size = 2, inherit.aes = FALSE)+
+  geom_polygon(data = lab.hulls, aes(PC1, PC2, color = LabClusters, fill = LabClusters ), 
+               alpha = 0.1, show.legend = FALSE, inherit.aes = FALSE) +
+  ggrepel::geom_label_repel( 
+    data = subset(df, 
+                  Status == "Control" | Status == "Immortalized"|
+                    title %in% labcells)
+    , size = 3,min.segment.length = 0, inherit.aes = FALSE,
+    aes(x = PC1, y = PC2, fill = LabClusters,label = title),
+    show.legend = FALSE)+
+  labs( x = paste("PC1 (", format(100*pca.variance.corrected[1], digits = 2), "%)"),
+        y = paste("PC2 (", format(100*pca.variance.corrected[2], digits = 2), "%)"),
+        title = "Lab cell lines Clustered") 
+#    scale_shape_manual(values = c(15:18)) +
+    # scale_color_brewer(type = "qual", palette = "Dark2")+
+  # viridis::scale_fill_viridis(discrete = TRUE)
+
+
+```
+
+```{r DEGs of lab clusters, results = 'markup'}
+
+index <- which(pheno.global$geo_accession %in% filter(df, LabClusters %in% c(1,4))$geo_accession)
+
+all.degs$LabCluster1 <- limma.top.table(name = "Lab cluster 1", 
+                                         dfactor = factor(
+                                           gsub("Immortalized","Control",pheno.global$Status[index])),
+                                         expression = global.exp.corrected[,c(1,index+1)],
+                                         contrast.vector = "Melanoma-Control")[[1]] %>% 
+  filter(adj.P.Val < 0.05 & abs(logFC)>1) %>% 
+  mutate(Direction = ifelse(logFC>0,"up", "down")) %>% 
+  dplyr::select(Direction, Gene = ID, logFC, adj.P.Val ) %>% 
+  arrange(by = Direction)
+
+# write.csv(all.degs$LabCluster1, file = file.path(data.dir,"LabCluster1.csv"),
+# quote = FALSE, row.names = FALSE)
+
+all.degs$LabCluster1  %>% mutate(Direction = cell_spec(Direction, color = "white", 
+                              background = factor(Direction, c("up", "down"), 
+                                                  c(rainbow(2))))) %>% 
+    kable(escape = FALSE,caption = "Differentially expressed genes in Lab cluster 1") %>% 
+  kable_styling("striped", full_width = TRUE) %>% 
+  scroll_box( height = "300px")
+
+# Now for cluster 2
+
+index <- which(pheno.global$geo_accession %in% filter(df, LabClusters %in% c(2,4))$geo_accession)
+
+all.degs$LabCluster2 <- limma.top.table(name = "Lab cluster 2", 
+                                         dfactor = factor(
+                                           gsub("Immortalized","Control",pheno.global$Status[index])),
+                                         expression = global.exp.corrected[,c(1,index+1)],
+                                         contrast.vector = "Melanoma-Control")[[1]] %>% 
+  filter(adj.P.Val < 0.05 & abs(logFC)>1) %>% 
+  mutate(Direction = ifelse(logFC>0,"up", "down")) %>% 
+  dplyr::select(Direction, Gene = ID, logFC, adj.P.Val ) %>% 
+  arrange(by = Direction)
+
+ # write.csv(all.degs$LabCluster2, file = file.path(data.dir,"LabCluster2.csv"),
+ # quote = FALSE, row.names = FALSE)
+
+all.degs$LabCluster2  %>% mutate(Direction = cell_spec(Direction, color = "white", 
+                              background = factor(Direction, c("up", "down"), 
+                                                  c(rainbow(2))))) %>% 
+    kable(escape = FALSE,caption = "Differentially expressed genes in Lab cluster 2") %>% 
+  kable_styling("striped", full_width = TRUE) %>% 
+  scroll_box( height = "300px")
+
+# Now for cluster 3
+
+index <- which(pheno.global$geo_accession %in% filter(df, LabClusters %in% c(3,4))$geo_accession)
+
+all.degs$LabCluster3 <- limma.top.table(name = "Lab cluster 3", 
+                                         dfactor = factor(
+                                           gsub("Immortalized","Control",pheno.global$Status[index])),
+                                         expression = global.exp.corrected[,c(1,index+1)],
+                                         contrast.vector = "Melanoma-Control")[[1]] %>% 
+  filter(adj.P.Val < 0.05 & abs(logFC)>1) %>% 
+  mutate(Direction = ifelse(logFC>0,"up", "down")) %>% 
+  dplyr::select(Direction, Gene = ID, logFC, adj.P.Val ) %>% 
+  arrange(by = Direction)
+
+# write.csv(all.degs$LabCluster3, file = file.path(data.dir,"LabCluster3.csv"), 
+#   quote = FALSE, row.names = FALSE) 
+
+all.degs$LabCluster3  %>% mutate(Direction = cell_spec(Direction, color = "white", 
+                              background = factor(Direction, c("up", "down"), 
+                                                  c(rainbow(2))))) %>% 
+    kable(escape = FALSE,caption = "Differentially expressed genes in Lab cluster 3") %>% 
+  kable_styling("striped", full_width = TRUE) %>% 
+  scroll_box( height = "300px")
+
+#Integrated dataset with the results
+all.degs.df <- map2_df(.x = all.degs, .y = names(all.degs), ~mutate(.x, Set = .y)) %>%
+  dplyr::select(1,2,3) %>% arrange(by = Direction,Gene)
+
+
+```
+
+#Connectivity Map results
+
+By inserting the above genes in the Query tool of the Connectivity map we get the compounds which could potentially reverse the signature of the cell, serving as a treatment.
+
+The only cell line selected from cMap is A-375 as it is the only melanoma cell line provided.
+The four tables below only contain compounds that have a maximum of -95 correlation with the signature that was queried, as those are considered the most promising results.
+
+```{r cMap A375, results = 'markup'}
+library(CePa)
+
+cmap <- read.gct(file.path(results.dir, "A375.gct")) %>% as.data.frame(., stringsAsFactors = F)
+colnames(cmap)[-c(1:7)] <- paste(cmap["cell_id",], cmap["name",])[-c(1:7)]
+cmap <- cmap[-c(1:5),] 
+cmap <- cmap %>% mutate(median_score = as.numeric(median_score),
+                                  `A375 Positive Control A-375` = 
+                                    as.numeric(`A375 Positive Control A-375`))
+
+df <- cmap %>% filter(median_score <= -80) %>% 
+  dplyr::select(name, description, target, belongs_to, 
+                `A-375` = `A375 Positive Control A-375`) %>% 
+  arrange(by = `A-375`)
+
+df %>% mutate(`A-375` = cell_spec(`A-375`, bold = TRUE,
+                                  background = spec_color(x = df$`A-375`),
+                                  color = spec_color(x = df$`A-375`, direction = -1)))%>%
+  kable(., align = "c",escape = F,caption = "A375 reverse signature") %>% kable_styling("striped", full_width = TRUE) %>% 
+  scroll_box( height = "300px")
+
+```
+
+
+```{r cMap results, results = 'markup'}
+library(CePa)
+
+cmap <- read.gct(file.path(results.dir, "results.gct")) %>% as.data.frame(., stringsAsFactors = F)
+colnames(cmap)[-c(1:7)] <- paste(cmap["cell_id",], cmap["name",])[-c(1:7)]
+cmap <- cmap[-c(1:6),]
+
+df <- cmap %>% gather(key = "Set", value = "Score", -c(1:7)) %>% 
+  mutate(Case_studied = gsub(".*Lab ", "", Set),
+                     cell_line = gsub(" Lab.*","", Set))
+df <- df %>% mutate(Score = as.numeric(Score),
+                    median_score = as.numeric(median_score))
+
+#Cluster 1
+tmp <- df %>% filter(cell_line == "A375", Case_studied == "Cluster 1 ") %>% filter(Score <= -90 ) %>% 
+  arrange(by = Score) %>% 
+  dplyr::select(name, description, target, belongs_to, median_score, Score, Case_studied, cell_line)
+
+
+tmp %>%   mutate(Score = cell_spec(Score, bold = TRUE,
+                                  background = spec_color(x = tmp$Score),
+                                  color = spec_color(x = tmp$Score, direction = -1)))%>%
+  kable(., align = "c",escape = F,caption = "Cluster 1 reverse signature") %>% kable_styling("striped", full_width = TRUE) %>% 
+  scroll_box( height = "300px")
+  
+#Cluster 2
+tmp <- df %>% filter(cell_line == "A375", Case_studied == "Cluster 2") %>% filter(Score <= -90 ) %>% 
+  arrange(by = Score) %>% 
+  dplyr::select(name, description, target, belongs_to, median_score, Score, Case_studied, cell_line)
+
+
+tmp %>%   mutate(Score = cell_spec(Score, bold = TRUE,
+                                  background = spec_color(x = tmp$Score),
+                                  color = spec_color(x = tmp$Score, direction = -1)))%>%
+  kable(., align = "c",escape = F,caption = "Cluster 2 reverse signature") %>% kable_styling("striped", full_width = TRUE) %>% 
+  scroll_box( height = "300px")
+
+#Cluster 3
+tmp <- df %>% filter(cell_line == "A375", Case_studied == "Cluster 3") %>% filter(Score <= -90 ) %>% 
+  arrange(by = Score) %>% 
+  dplyr::select(name, description, target, belongs_to, median_score, Score, Case_studied, cell_line)
+
+
+tmp %>%   mutate(Score = cell_spec(Score, bold = TRUE,
+                                  background = spec_color(x = tmp$Score),
+                                  color = spec_color(x = tmp$Score, direction = -1)))%>%
+  kable(., align = "c",escape = F,caption = "Cluster 3 reverse signature") %>% kable_styling("striped", full_width = TRUE) %>% 
+  scroll_box( height = "300px")
+```
+
+
+```{r save image, eval = FALSE, include = FALSE}
+save.image(file.path(data.dir, "labreport.RData"))
+```
+
